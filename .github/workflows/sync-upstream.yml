@@ -1,26 +1,64 @@
+# .github/workflows/sync-upstream.yml
 name: Sync Upstream
 
 on:
   schedule:
-    - cron: '0 4 * * *'
+    - cron: '0 4 * * *'      # daily at 04:00 UTC
   workflow_dispatch:
 
-jobs:
-  rebase:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout your code
-        uses: actions/checkout@v4           # latest stable
+permissions:
+  contents: write           # needed to push commits
 
-      - name: Ensure sync scripts are executable
-        run: chmod +x scripts/sync-upstream.sh
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4       # latest stable checkout action  [oai_citation:0‡GitHub](https://github.com/actions/checkout?utm_source=chatgpt.com)
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+
+      - name: Add upstream remote & merge
+        run: |
+          git remote add upstream https://github.com/danny-avila/LibreChat.git
+          git fetch upstream main
+          git checkout main
+          git merge upstream/main --no-edit
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4         # latest stable
+        uses: actions/setup-node@v4    # latest stable setup-node  [oai_citation:1‡GitHub](https://github.com/actions/setup-node?utm_source=chatgpt.com)
         with:
-          node-version: '18'                # match LibreChat’s Node.js 18+ requirement
+          node-version: '20.x'          # LibreChat uses Node 20 (Node 16 is deprecated)  [oai_citation:2‡The GitHub Blog](https://github.blog/changelog/2024-03-06-github-actions-all-actions-will-run-on-node20-instead-of-node16-by-default/?utm_source=chatgpt.com) [oai_citation:3‡GitHub](https://github.com/danny-avila/LibreChat/blob/main/client/package.json)
           cache: 'npm'
 
-      - name: Sync with upstream (verbose)
-        run: scripts/sync-upstream.sh
-        shell: bash
+      - name: Install jscodeshift
+        run: npm install --prefix . jscodeshift@^17.3.0
+
+      - name: Apply frontend codemod
+        run: npx jscodeshift -t codemods/insert-pluginloader.js frontend/src/index.tsx
+
+      - name: Apply server codemod
+        run: npx jscodeshift -t codemods/insert-pluginserver.js api/app/index.ts
+
+      - name: Update package.json dependencies
+        run: node scripts/update-packagejson.js
+
+      - name: Clean install dependencies
+        run: |
+          npm ci                           # root install
+          npm ci --prefix api/app          # api/app install
+          npm ci --prefix frontend         # frontend install
+
+      - name: Commit & push changes
+        uses: EndBug/add-and-commit@v9.1.4  # latest stable add-and-commit  [oai_citation:4‡GitHub](https://github.com/EndBug/add-and-commit/releases?utm_source=chatgpt.com)
+        with:
+          author_name: "github-actions"
+          author_email: "actions@github.com"
+          message: chore: reapply plugin framework + bump deps & lockfiles
+          push: true
