@@ -1,54 +1,23 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
+// scripts/update-packagejson.js
+import { readFileSync, writeFileSync } from 'fs';
+import { resolve } from 'path';
+
+const targets = ['package.json', 'api/app/package.json', 'client/package.json'];
+
 /**
- * scripts/update-packagejson.js
- *
- * Ensures your three package.jsons get the right deps,
- * whether your front-end lives in `frontend/` or `client/`.
+ * Merge deps into specified field of a package.json
  */
-
-const fs = require('fs');
-const path = require('path');
-
-function ensureDeps(relPath, deps, dev = false) {
-  const pkgPath = path.resolve(__dirname, '..', relPath);
-  if (!fs.existsSync(pkgPath)) {
-    console.warn(`⚠️  Skipping missing ${relPath}`);
-    return;
-  }
-  const text = fs.readFileSync(pkgPath, 'utf8');
-  let pkg;
-  try {
-    pkg = JSON.parse(text);
-  } catch (err) {
-    console.error(`❌ Failed to parse ${relPath}:`, err.message);
-    process.exit(1);
-  }
-  const section = dev ? 'devDependencies' : 'dependencies';
-  pkg[section] = pkg[section] || {};
-  for (const [name, version] of Object.entries(deps)) {
-    pkg[section][name] = version;
-  }
-  fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
-  console.log(`✅ Updated ${relPath} [${section}]`);
+function ensureDeps(pkgPath, deps, dev = false) {
+  const fullPath = resolve(process.cwd(), pkgPath);
+  const pkg = JSON.parse(readFileSync(fullPath, 'utf-8'));
+  const field = dev ? 'devDependencies' : 'dependencies';
+  pkg[field] = { ...pkg[field], ...deps };
+  writeFileSync(fullPath, JSON.stringify(pkg, null, 2) + '\n');
 }
 
-// 1) Root devDependencies
-ensureDeps('package.json', {
-  'jscodeshift': '^17.3.0'
-}, true);
+// Example: always ensure Elysia is installed in api/app
+ensureDeps('api/app/package.json', { elysia: '^1.5.0', '@elysiajs/static': '^1.0.0' });
 
-// 2) API server dependencies
-ensureDeps('api/app/package.json', {
-  'express': '^5.1.0'
-}, false);
-
-// 3) Frontend dependencies — try frontend/, then client/
-const frontendPath = fs.existsSync(path.resolve(__dirname, '../frontend/package.json'))
-  ? 'frontend/package.json'
-  : 'client/package.json';
-
-ensureDeps(frontendPath, {
-  '@opentelemetry/api': '^1.9.0',
-  '@opentelemetry/sdk-trace-web': '^2.0.0',
-  '@opentelemetry/sdk-trace-base': '^2.0.0'
-}, false);
+// Other global deps (OTel, jscodeshift) can be managed similarly...
+console.log('✅ package.json dependencies updated.');
