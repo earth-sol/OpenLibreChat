@@ -51,9 +51,11 @@ jobs:
 
       - name: Clean install dependencies
         run: |
-          npm ci                           # root install
-          npm ci --prefix api/app          # api/app install
-          npm ci --prefix frontend         # frontend install
+          npm install                           # root install
+          npm install --prefix api/app          # api/app install
+          npm install --prefix client
+          npm install --prefix frontend         # frontend install
+          
 
       - name: Commit & push changes
         uses: EndBug/add-and-commit@v9.1.4  # latest stable add-and-commit
