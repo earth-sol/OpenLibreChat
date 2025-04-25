@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+
+git remote add upstream https://github.com/danny-avila/LibreChat.git
+
 set -exuo pipefail   # ← note the added -x for debug tracing
 
 echo "🔄 Fetching latest from upstream..."
