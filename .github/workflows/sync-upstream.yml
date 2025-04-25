@@ -15,7 +15,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4       # latest stable checkout action  [oai_citation:0‡GitHub](https://github.com/actions/checkout?utm_source=chatgpt.com)
+        uses: actions/checkout@v4       # latest stable checkout action
         with:
           fetch-depth: 0
 
@@ -56,7 +56,7 @@ jobs:
           npm ci --prefix frontend         # frontend install
 
       - name: Commit & push changes
-        uses: EndBug/add-and-commit@v9.1.4  # latest stable add-and-commit  [oai_citation:4‡GitHub](https://github.com/EndBug/add-and-commit/releases?utm_source=chatgpt.com)
+        uses: EndBug/add-and-commit@v9.1.4  # latest stable add-and-commit
         with:
           author_name: "github-actions"
           author_email: "actions@github.com"
