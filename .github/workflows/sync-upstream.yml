@@ -60,5 +60,5 @@ jobs:
         with:
           author_name: "github-actions"
           author_email: "actions@github.com"
-          message: chore: reapply plugin framework + bump deps & lockfiles
+          message: reapply plugin framework + bump deps & lockfiles
           push: true
