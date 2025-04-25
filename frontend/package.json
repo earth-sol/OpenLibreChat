@@ -1,0 +1,9 @@
+// frontend/package.json (excerpt)
+{
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/sdk-trace-web": "^2.0.0",
+    "@opentelemetry/sdk-trace-base": "^2.0.0",
+    // … all your existing deps (react, react-dom, vite, etc.) unchanged …
+  }
+}
