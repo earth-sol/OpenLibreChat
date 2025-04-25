@@ -1,3 +1,4 @@
+import PluginLoader from './plugin-runtime/PluginLoader';
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
@@ -11,7 +12,7 @@ const root = ReactDOM.createRoot(
 root.render(
   <React.StrictMode>
     <PluginLoader>
-      <App />
+      <PluginLoader><App /></PluginLoader>
     </PluginLoader>
   </React.StrictMode>
 );
