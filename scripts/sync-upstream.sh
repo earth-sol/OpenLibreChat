@@ -2,51 +2,49 @@
 
 git remote add upstream https://github.com/danny-avila/LibreChat.git
 
-set -exuo pipefail   # ← note the added -x for debug tracing
+# 1️⃣ Fetch upstream
+echo "🔄 Fetching upstream/main…"
+git fetch upstream main
 
-echo "🔄 Fetching latest from upstream..."
-git fetch upstream
+# 2️⃣ Checkout your main and bring it up to date
+echo "🔀 Checking out your main branch…"
+git checkout main
+git pull --ff-only origin main
 
-echo "🔀 Checking out (or creating) branch upstream-sync..."
-if git rev-parse --verify upstream-sync &>/dev/null; then
-  git checkout upstream-sync
-else
-  git checkout -b upstream-sync
-fi
+# 3️⃣ Merge upstream/main into your main
+echo "🔀 Merging upstream/main…"
+git merge upstream/main -m "chore: merge upstream/main into fork"
 
-echo "💥 Hard-resetting to upstream/main…"
-git reset --hard upstream/main
-
-echo "🛠️  Reapplying AST codemods…"
+# 4️⃣ Reapply AST transforms (codemods)
+echo "🛠️  Reapplying codemods…"
 npx jscodeshift -t codemods/insert-pluginloader.js frontend/src/index.tsx
 npx jscodeshift -t codemods/insert-pluginserver.js api/app/index.ts
 
-echo "📦 Updating package.json deps…"
+# 5️⃣ Programmatically bump package.jsons
+echo "📦 Updating package.json dependencies…"
 node scripts/update-packagejson.js
 
-echo "⚙️  Installing dependencies (clean)…"
-npm ci --verbose
-npm ci --prefix api/app --verbose
-npm ci --prefix frontend --verbose
+# 6️⃣ Clean install in each workspace
+echo "⚙️  Installing dependencies…"
+npm ci
+npm ci --prefix api/app
+npm ci --prefix frontend
 
-echo "✅ Staging modifications…"
+# 7️⃣ Stage only the files we expect to change
+echo "✅ Staging changes…"
 git add \
   frontend/src/index.tsx \
   api/app/index.ts \
   package.json package-lock.json \
   api/app/package.json api/app/package-lock.json \
-  frontend/package.json frontend/package-lock.json \
-  codemods/ scripts/
+  frontend/package.json frontend/package-lock.json
 
+# 8️⃣ Commit codemod + dep bumps + lockfiles
 echo "📝 Committing changes…"
-git commit -m "chore: reapply plugin runtime + bump deps & lockfiles"
+git commit -m "chore: reapply plugin framework + bump deps & lockfiles"
 
-echo "🔀 Merging into main…"
-git checkout main
-git pull --rebase origin main
-git merge --no-ff upstream-sync -m "chore: bump upstream + reapply plugin framework"
-
-echo "🚀 Pushing updated main…"
+# 9️⃣ Push back to your fork
+echo "🚀 Pushing to origin/main…"
 git push origin main --force
 
 echo "🎉 Sync complete!"
