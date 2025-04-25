@@ -1,119 +1,85 @@
-import React, { ReactNode, useEffect, useState } from 'react';
-import {
-  diag,
-  DiagConsoleLogger,
-  DiagLogLevel,
-  trace
-} from '@opentelemetry/api';
-import {
-  WebTracerProvider
-} from '@opentelemetry/sdk-trace-web';
-import {
-  SimpleSpanProcessor,
-  ConsoleSpanExporter
-} from '@opentelemetry/sdk-trace-base';
+// client/src/plugin-runtime/PluginLoader.tsx
+import React, { useEffect, useState, createContext, useContext } from 'react';
+import { usePluginApi, registerPlugin } from 'librechat-ui';
 
-interface PluginManifest {
-  id: string;
-  ui: string;    // e.g. "ui.js"
-  url: string;   // e.g. "/plugins/example-plugin"
-  order?: number;
+interface ServerConfig {
+  pluginServer: { staticPrefix: string; pluginsDir: string };
+  api: { manifestRoute: string; configRoute: string };
 }
 
-const PluginLoader: React.FC<{ children: ReactNode }> = ({ children }) => {
-  const [manifests, setManifests] = useState<PluginManifest[]>([]);
+// Context for server config
+const ConfigContext = createContext<ServerConfig | null>(null);
+export const useServerConfig = () => {
+  const cfg = useContext(ConfigContext);
+  if (!cfg) throw new Error('ServerConfig missing');
+  return cfg;
+};
 
+const Loader: React.FC = ({ children }) => {
+  const [config, setConfig] = useState<ServerConfig | null>(null);
+  const pluginApi = usePluginApi();
+
+  // Fetch server config at startup
   useEffect(() => {
-    // ——— 1) OpenTelemetry setup ———
-    diag.setLogger(new DiagConsoleLogger(), DiagLogLevel.INFO);
-    const provider = new WebTracerProvider({
-      // default spanProcessors
-    });
-    provider.addSpanProcessor(new SimpleSpanProcessor(new ConsoleSpanExporter()));
-    provider.register();
-    const tracer = trace.getTracer('plugin-loader');
-
-    // ——— 2) Expose global APIs ———
-    window.__pluginApis = {};
-    window.registerMyPlugin = (id, api) => {
-      window.__pluginApis[id] = api;
-    };
-    window.toolApi = {
-      invoke: (toolId, args) =>
-        fetch(`/api/v1/tools/${toolId}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(args),
-        }).then(r => r.json())
-    };
-    window.libreChat = {
-      config: (window as any).__LIBRECHAT_CONFIG__ || {},
-      getVersion: () => (window as any).__LIBRECHAT_VERSION__ || '0.7.7',
-      getUser: () => (window as any).__LIBRECHAT_USER__ || { id: '', name: '' },
-    };
-    window.ragApi = {
-      ingest: (conversationId, fileIds) => {
-        const url = `${window.libreChat.config.RAG_API_URL}/ingest`;
-        return fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ conversation_id: conversationId, file_ids: fileIds }),
-        }).then(r => r.json());
-      },
-      query: (conversationId, query, top_k = 4) => {
-        const url = `${window.libreChat.config.RAG_API_URL}/query`;
-        return fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ conversation_id: conversationId, query, top_k }),
-        }).then(r => r.json());
-      }
-    };
-    window.reloadPlugin = (id: string) => {
-      setManifests(prev => [...prev]);
-    };
-
-    // ——— 3) Load manifests ———
-    fetch('/api/plugins')
-      .then(r => r.json())
-      .then((list: PluginManifest[]) => {
-        list.sort((a, b) => (a.order || 0) - (b.order || 0));
-        setManifests(list);
-      })
-      .catch(err => console.error('Failed to fetch plugin manifests', err));
+    fetch('/api/config')
+      .then(res => res.json())
+      .then((cfg: ServerConfig) => setConfig(cfg))
+      .catch(console.error);
   }, []);
+
+  if (!config) return <div>Loading configuration…</div>;
+
+  // Expose registerMyPlugin globally
+  window.loadPlugin = async (id: string, url: string) => {
+    const mod = await import(/* @vite-ignore */ url);
+    if (mod.default) mod.default({ pluginApi });
+  };
+
+  return (
+    <ConfigContext.Provider value={config}>
+      {children}
+    </ConfigContext.Provider>
+  );
+};
+
+// Main wrapper
+const PluginLoaderWrapper: React.FC = () => {
+  const { api } = useServerConfig();
+  const [manifests, setManifests] = useState<any[]>([]);
+
+  // Poll for plugin manifests
+  useEffect(() => {
+    const fetchManifests = () =>
+      fetch(api.manifestRoute)
+        .then(res => res.json())
+        .then(setManifests)
+        .catch(console.error);
+
+    fetchManifests();
+    const id = setInterval(fetchManifests, 30_000);                             // configurable polling  [oai_citation:10‡Medium](https://medium.com/%40laidrivm/what-i-learned-by-building-a-static-website-with-bun-elysia-and-jsx-in-2024-dac7d4d19521?utm_source=chatgpt.com)
+    return () => clearInterval(id);
+  }, [api.manifestRoute]);
 
   return (
     <>
-      {children}
-      {manifests.map(manifest => {
-        const tracer = trace.getTracer('plugin-run');
-        const span = tracer.startSpan(`load-plugin-${manifest.id}`);
-
-        const Component = React.lazy(() =>
-          import(`${manifest.url}/${manifest.ui}?t=${Date.now()}`)
-            .then(mod => {
-              span.setStatus({ code: 1 }); // OK
-              span.end();
-              return mod;
-            })
-            .catch(err => {
-              span.recordException(err);
-              span.setStatus({ code: 2, message: err.message });
-              span.end();
-              console.error(`Plugin ${manifest.id} failed to load`, err);
-              return { default: () => null };
-            })
-        );
-
-        return (
-          <React.Suspense key={manifest.id} fallback={null}>
-            <Component />
-          </React.Suspense>
-        );
-      })}
+      {manifests.map(m => (
+        <React.Fragment key={m.id}>
+          {window.loadPlugin(m.id, m.url)}
+        </React.Fragment>
+      ))}
     </>
   );
 };
 
-export default PluginLoader;
+export default () => (
+  <Loader>
+    <PluginLoaderWrapper />
+  </Loader>
+);
+
+// Register in LibreChat UI (if needed)
+registerPlugin({
+  id: 'plugin-loader',
+  settingsComponent: null, // could hook in a SettingsPanel later
+  render: () => <PluginLoaderWrapper />
+});
