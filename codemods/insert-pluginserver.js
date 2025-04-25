@@ -1,9 +1,9 @@
 /**
- * Injects pluginServer into api/app/index.ts
+ * Injects pluginServer into api/app/index.js
  */
 export default function transformer(file, api) {
   const j = api.jscodeshift;
-  if (!/api\/app\/index\.ts$/.test(file.path)) return null;
+  if (!/api\/app\/index\.js$/.test(file.path)) return null;
   const root = j(file.source);
   const body = root.get().node.program.body;
 
