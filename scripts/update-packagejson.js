@@ -6,18 +6,36 @@ import { resolve } from 'path';
 const targets = ['package.json', 'api/app/package.json', 'client/package.json'];
 
 /**
- * Merge deps into specified field of a package.json
+ * Merge or remove dependencies in package.json
  */
-function ensureDeps(pkgPath, deps, dev = false) {
+function syncPackage(pkgPath, addDeps = {}, addDev = {}, removeDeps = []) {
   const fullPath = resolve(process.cwd(), pkgPath);
   const pkg = JSON.parse(readFileSync(fullPath, 'utf-8'));
-  const field = dev ? 'devDependencies' : 'dependencies';
-  pkg[field] = { ...pkg[field], ...deps };
-  writeFileSync(fullPath, JSON.stringify(pkg, null, 2) + '\n');
+
+  // Remove unwanted dependencies
+  removeDeps.forEach(dep => {
+    if (pkg.dependencies && pkg.dependencies[dep]) {
+      delete pkg.dependencies[dep];
+    }
+    if (pkg.devDependencies && pkg.devDependencies[dep]) {
+      delete pkg.devDependencies[dep];
+    }
+  });
+
+  // Merge in new dependencies
+  pkg.dependencies     = { ...pkg.dependencies,     ...addDeps     };
+  pkg.devDependencies  = { ...pkg.devDependencies,  ...addDev      };
+
+  writeFileSync(fullPath, JSON.stringify(pkg, null, 2) + '\n', 'utf-8');
 }
 
-// Example: always ensure Elysia is installed in api/app
-ensureDeps('api/app/package.json', { elysia: '^1.5.0', '@elysiajs/static': '^1.0.0' });
+// Remove Express from api/app and ensure Elysia deps are present
+syncPackage(
+  'api/app/package.json',
+  { elysia: '^1.5.0', '@elysiajs/static': '^1.2.0' }, // add
+  {},                                                // no dev
+  ['express']                                        // remove
+);
 
-// Other global deps (OTel, jscodeshift) can be managed similarly...
-console.log('✅ package.json dependencies updated.');
+// (Optionally ensure other packages like jscodeshift, OpenTelemetry exist…)
+console.log('✅ package.json scripts updated.');
