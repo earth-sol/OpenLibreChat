@@ -10,13 +10,13 @@ export default function transformer(file, api) {
     .find(j.ImportDeclaration, {
       source: { value: 'express' }
     })
-    .remove(); // Remove Express import  [oai_citation:0‡Hypermod](https://www.hypermod.io/docs/guides/import-manipulation?utm_source=chatgpt.com)
+    .remove(); // Remove Express import
 
   root
     .find(j.ImportDeclaration, {
       source: { value: './pluginServer' }
     })
-    .remove(); // Remove pluginServer import  [oai_citation:1‡Gist](https://gist.github.com/8f5a6a78268839abaca78ad1fbe8368c?utm_source=chatgpt.com)
+    .remove(); // Remove pluginServer import
 
   //
   // 2. Insert Elysia, staticPlugin, fs, path imports
@@ -27,28 +27,28 @@ export default function transformer(file, api) {
       [ j.importSpecifier(j.identifier('Elysia')), j.importSpecifier(j.identifier('file')) ],
       j.literal('elysia')
     )
-  ); //  [oai_citation:2‡TalentConnect](https://www.toptal.com/javascript/write-code-to-rewrite-your-code?utm_source=chatgpt.com)
+  );
 
   firstImport.insertBefore(
     j.importDeclaration(
       [ j.importSpecifier(j.identifier('staticPlugin')) ],
       j.literal('@elysiajs/static')
     )
-  ); //  [oai_citation:3‡Elysia - Ergonomic Framework for Humans](https://elysiajs.com/plugins/static?utm_source=chatgpt.com)
+  );
 
   firstImport.insertBefore(
     j.importDeclaration(
       [ j.importSpecifier(j.identifier('readFileSync')) ],
       j.literal('fs')
     )
-  ); //  [oai_citation:4‡jscodeshift](https://jscodeshift.com/build/api-reference/?utm_source=chatgpt.com)
+  );
 
   firstImport.insertBefore(
     j.importDeclaration(
       [ j.importSpecifier(j.identifier('resolve')), j.importSpecifier(j.identifier('join')) ],
       j.literal('path')
     )
-  ); //  [oai_citation:5‡jscodeshift](https://jscodeshift.com/build/api-reference/?utm_source=chatgpt.com)
+  );
 
   //
   // 3. Inject config-loading boilerplate after imports
@@ -65,7 +65,7 @@ export default function transformer(file, api) {
     const CONFIG_ROUTE = process.env.PLUGIN_CONFIG_ROUTE   || cfg.api.configRoute;
   `);
 
-  firstImport.insertBefore(configAst); //  [oai_citation:6‡Elysia - Ergonomic Framework for Humans](https://elysiajs.com/tutorial?utm_source=chatgpt.com)
+  firstImport.insertBefore(configAst);
 
   //
   // 4. Replace `const app = express()` with `const app = new Elysia()`
@@ -82,7 +82,7 @@ export default function transformer(file, api) {
           j.newExpression(j.identifier('Elysia'), [])
         )
       );
-    }); //  [oai_citation:7‡jscodeshift](https://jscodeshift.com/build/api-reference/?utm_source=chatgpt.com)
+    });
 
   //
   // 5. Remove any existing `app.use(pluginServer)` calls
@@ -97,7 +97,7 @@ export default function transformer(file, api) {
         arguments: [{ name: 'pluginServer' }]
       }
     })
-    .remove(); //  [oai_citation:8‡jscodeshift](https://jscodeshift.com/build/api-reference/?utm_source=chatgpt.com)
+    .remove();
 
   //
   // 6. Inject .use(staticPlugin) and .get(...) before app.listen(...)
@@ -121,7 +121,7 @@ export default function transformer(file, api) {
           ]
         )
       )
-    ); //  [oai_citation:9‡Elysia - Ergonomic Framework for Humans](https://elysiajs.com/plugins/static?utm_source=chatgpt.com)
+    );
 
     // Insert manifest route
     j(path).insertBefore(
@@ -246,7 +246,7 @@ export default function transformer(file, api) {
           ]
         )
       )
-    ); //  [oai_citation:10‡Elysia - Ergonomic Framework for Humans](https://elysiajs.com/essential/route?utm_source=chatgpt.com)
+    );
 
     // Insert config route
     j(path).insertBefore(
@@ -276,7 +276,7 @@ export default function transformer(file, api) {
           ]
         )
       )
-    ); //  [oai_citation:11‡Elysia - Ergonomic Framework for Humans](https://elysiajs.com/essential/route?utm_source=chatgpt.com)
+    );
   });
 
   return root.toSource({ quote: 'single', trailingComma: true });
