@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -e
-git remote add upstream https://github.com/danny-avila/LibreChat.gi
+git remote add upstream https://github.com/danny-avila/LibreChat.git
 # 1) Fetch & reset to upstream
 git fetch upstream
 git checkout -B upstream-sync upstream/main
