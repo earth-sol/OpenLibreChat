@@ -32,9 +32,9 @@ jobs:
           git merge upstream/main --no-edit
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4    # latest stable setup-node  [oai_citation:1‡GitHub](https://github.com/actions/setup-node?utm_source=chatgpt.com)
+        uses: actions/setup-node@v4    # latest stable setup-node
         with:
-          node-version: '20.x'          # LibreChat uses Node 20 (Node 16 is deprecated)  [oai_citation:2‡The GitHub Blog](https://github.blog/changelog/2024-03-06-github-actions-all-actions-will-run-on-node20-instead-of-node16-by-default/?utm_source=chatgpt.com) [oai_citation:3‡GitHub](https://github.com/danny-avila/LibreChat/blob/main/client/package.json)
+          node-version: '20.x'          # LibreChat uses Node 20
           cache: 'npm'
 
       - name: Install jscodeshift
