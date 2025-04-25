@@ -46,7 +46,7 @@ jobs:
         with:
           author_name: github-actions
           author_email: actions@github.com
-          message: chore: protect custom folders via merge=ours (pre-merge)
+          message: "chore: protect custom folders via merge=ours (pre-merge)"
           files: .gitattributes
           push: false
       - name: Add upstream remote & merge
@@ -74,7 +74,7 @@ jobs:
         with:
           author_name: github-actions
           author_email: actions@github.com
-          message: chore: protect custom folders via merge=ours (post-merge)
+          message: "chore: protect custom folders via merge=ours (post-merge)"
           files: .gitattributes
           push: false
 
@@ -111,5 +111,5 @@ jobs:
         with:
           author_name: "github-actions"
           author_email: "actions@github.com"
-          message: reapply plugin framework + bump deps & lockfiles
+          message: "reapply plugin framework + bump deps & lockfiles"
           push: true
