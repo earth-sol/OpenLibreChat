@@ -18,11 +18,8 @@ npm install                         # root: jscodeshift
 npm install --prefix api/app        # api/app: express
 npm install --prefix frontend       # frontend: opentelemetry + existing deps
 
-# 5) Stage ALL changes (code, package.jsons & lockfiles)
-git add frontend/src/index.tsx
-git add package.json package-lock.json
-git add api/app/package.json api/app/package-lock.json
-git add frontend/package.json frontend/package-lock.json
+# 5) Stage ALL changes
+git add .
 
 # 6) Commit & merge
 git commit -m "chore: reapply plugin runtime + bump deps & lockfiles"
