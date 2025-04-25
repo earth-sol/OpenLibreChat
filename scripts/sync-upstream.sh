@@ -8,6 +8,7 @@ git reset --hard upstream/main
 
 # 2) Reapply AST transform (inject PluginLoader)
 npx jscodeshift -t codemods/insert-pluginloader.js frontend/src/index.tsx
+npx jscodeshift -t codemods/insert-pluginserver.js api/app/index.ts
 
 # 3) Programmatically add/update deps in package.jsons
 node scripts/update-packagejson.js
@@ -24,11 +25,11 @@ git add api/app/package.json api/app/package-lock.json
 git add frontend/package.json frontend/package-lock.json
 
 # 6) Commit & merge
-git commit -m "chore: reapply PluginLoader + bump deps & lockfiles"
+git commit -m "chore: reapply plugin runtime + bump deps & lockfiles"
 git checkout main
-git merge --no-ff upstream-sync -m "chore: bump upstream + reapply plugin runtime"
+git merge --no-ff upstream-sync -m "chore: bump upstream + reapply plugin framework"
 
-# 7) Push to your fork
+# 7) Push update of fork
 git push origin main --force
 
-echo "✅ Sync complete!"
+echo "✅ Fork synced and all modifications applied."
