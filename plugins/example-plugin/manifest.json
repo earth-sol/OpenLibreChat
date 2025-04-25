@@ -1,0 +1,6 @@
+{
+  "id": "example-plugin",
+  "title": "Example Plugin",
+  "ui": "ui.js",
+  "order": 100
+}
