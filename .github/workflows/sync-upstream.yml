@@ -9,15 +9,18 @@ jobs:
   rebase:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-        with: { fetch-depth: 0 }
-      - uses: actions/setup-node@v3
-        with: { node-version: '18' }
-      - run: npm install --prefix . jscodeshift
-      - name: Ensure sync script is executable
+      - name: Checkout your code
+        uses: actions/checkout@v4           # latest stable
+
+      - name: Ensure sync scripts are executable
         run: chmod +x scripts/sync-upstream.sh
-      - run: scripts/sync-upstream.sh
-      - uses: ad-m/github-push-action@v0.6.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4         # latest stable
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          branch: main
+          node-version: '18'                # match LibreChat’s Node.js 18+ requirement
+          cache: 'npm'
+
+      - name: Sync with upstream (verbose)
+        run: scripts/sync-upstream.sh
+        shell: bash
