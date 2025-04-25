@@ -41,7 +41,7 @@ jobs:
         run: npm install --prefix . jscodeshift@^17.3.0
 
       - name: Apply frontend codemod
-        run: npx jscodeshift --parser=tsx extensions=ts,tsx,js,jsx -t codemods/insert-pluginloader.js frontend/src/index.tsx
+        run: npx jscodeshift --parser=tsx --extensions=ts,tsx,js,jsx -t codemods/insert-pluginloader.js frontend/src/index.tsx
 
       - name: Apply server codemod
         run: npx jscodeshift --parser=babel -t codemods/insert-pluginserver.js api/app/index.js
