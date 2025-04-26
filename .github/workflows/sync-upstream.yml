@@ -79,15 +79,16 @@ jobs:
           message: "chore: protect custom folders via merge=ours (post-merge)"
           files: .gitattributes
           push: false
-
+      - name: 🔍 Cleaning up JS lockfiles…
+        run: find . -maxdepth 2 -type f \( -name 'package-lock.json' -o -name 'yarn.lock' -o -name 'pnpm-lock.yaml' -o -name 'bun.lockb' \) -print -exec rm -f {} +
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
           bun-version-file: '.bun-version'
       - name: Update package.json dependencies
         run: bun run scripts/update-packagejson.js
-      - name: Install jscodeshift
-        run: bun install --frozen-lockfile
+      - name: 📦 Installing dependencies…
+        run: bun install
 
       - name: Apply frontend codemod
         run: bun run jscodeshift -t codemods/insert-pluginloader.js         --parser=tsx --extensions=tsx,ts client/src/main.jsx
