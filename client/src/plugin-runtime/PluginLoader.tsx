@@ -56,7 +56,7 @@ const PluginLoaderWrapper: React.FC = () => {
         .catch(console.error);
 
     fetchManifests();
-    const id = setInterval(fetchManifests, 30_000);                             // configurable polling  [oai_citation:10‡Medium](https://medium.com/%40laidrivm/what-i-learned-by-building-a-static-website-with-bun-elysia-and-jsx-in-2024-dac7d4d19521?utm_source=chatgpt.com)
+    const id = setInterval(fetchManifests, 30_000);
     return () => clearInterval(id);
   }, [api.manifestRoute]);
 
@@ -77,7 +77,7 @@ export default () => (
   </Loader>
 );
 
-// Register in LibreChat UI (if needed)
+// Register in LibreChat UI
 registerPlugin({
   id: 'plugin-loader',
   settingsComponent: null, // could hook in a SettingsPanel later
