@@ -20,8 +20,11 @@ jobs:
           fetch-depth: 0
       - name: Ensure upstream remote
         run: |
-          if ! git remote get-url upstream > /dev/null 2>&1; then
+          if ! git remote get-url upstream; then
+            echo "Upstream not found – adding it now."
             git remote add upstream https://github.com/danny-avila/LibreChat.git
+          else
+            echo "Upstream already exists at: $(git remote get-url upstream)"
           fi
 
       - name: Configure Git
