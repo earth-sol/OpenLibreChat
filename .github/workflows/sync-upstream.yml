@@ -3,11 +3,11 @@ name: Sync Upstream
 
 on:
   schedule:
-    - cron: '0 4 * * *'      # daily at 04:00 UTC
+    - cron: '0 0 * * *'
   workflow_dispatch:
 
 permissions:
-  contents: write           # needed to push commits
+  contents: write # needed to push commits
 
 jobs:
   sync:
@@ -15,7 +15,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4       # latest stable checkout action
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Ensure "upstream" remote exists
@@ -31,91 +31,125 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-      - name: gitattributes protections (pre-merge)
+ 
+      - name: Defining protectedForkPaths
         run: |
-          gitattributepatterns=(
-            "client/src/plugin-runtime/** merge=ours"
-            "plugins/** merge=ours"
-            "scripts/** merge=ours"
-            "codemods/** merge=ours"
-            ".bun-version merge=ours"
+          protectedForkPaths=(
+            "client/src/plugin-runtime"
+            "plugins"
+            "scripts"
+            "codemods"
+            ".bun-version"
+            "README.md"
+            ".github/workflows"
+            "config/config.json"
           )
-          for pat in "${gitattributepatterns[@]}"; do
-            grep -qxF "$pat" .gitattributes || echo "$pat" >> .gitattributes
+ 
+      - name: "🔒 Stashing protected files..."
+        run: |
+          tmp=$(mktemp -d)
+          for path in "${protectedForkPaths[@]}"; do
+            if [ -e "$path" ]; then
+              mkdir -p "$tmp/$(dirname "$path")"
+              cp -R "$path" "$tmp/$path"
+              echo "  • $path"
+            fi
           done
-          git config merge.ours.driver true
-          git add .gitattributes && git commit -m "chore: .gitattributes merge=ours pre-merge" || true
-      - name: update upstream remote & merge
+ 
+      - name: "📡 Fetching upstream and resetting to pristine state..."
         run: |
           git fetch upstream main
           git checkout main
-          git pull --ff-only origin main
-          git merge upstream/main -m "chore: merge upstream/main into fork"
-      - name: Append merge=ours rules (post-merge)
-        run: |
-          for pat in "${gitattributepatterns[@]}"; do
-            grep -qxF "$pat" .gitattributes || echo "$pat" >> .gitattributes
-          done
-          git config merge.ours.driver true
-          git add .gitattributes && git commit -m "chore: .gitattributes merge=ours post-merge" || true
-      - name: 🔍 Cleaning up JS lockfiles…
+          git reset --hard upstream/main
+          git clean -fdx
+ 
+      - name: "🗑️ Cleaning up JS lockfiles…"
         run: find . -maxdepth 2 -type f \( -name 'package-lock.json' -o -name 'yarn.lock' -o -name 'pnpm-lock.yaml' -o -name 'bun.lockb' \) -print -exec rm -f {} +
         
+      - name: "🔍 Checking for any upstream-provided protected paths..."
+        run: |
+          upstream_changed=false
+          for path in "${protectedForkPaths[@]}"; do
+            if [ -e "$path" ]; then
+              echo "⚠️  Upstream introduced protected path: $path"
+              upstream_changed=true
+            fi
+          done 
+          if ! $upstream_changed; then
+            echo "✅ No upstream changes detected in protected paths."
+          fi
+      - name: "🔄 Restoring protected files from stash..."
+        run: |
+          for path in "${protectedForkPaths[@]}"; do
+            # remove whatever upstream put there (if anything)
+            rm -rf "$path"
+            # restore from our stash
+            if [ -e "$tmp/$path" ]; then
+              mkdir -p "$(dirname "$path")"
+              cp -R "$tmp/$path" "$path"
+              echo "   • Restored $path"
+            else
+              echo "   • ⚠️  Missing in stash (was not a protected file?): $path"
+            fi
+          done
+          # clean up temp stash
+          rm -rf "$tmp"
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
           bun-version-file: '.bun-version'
           
-      - name: Update package.json dependencies
+      - name: "📦 Update package.json dependencies"
         run: bun run scripts/update-packagejson.js
         
-      - name: Installing dependencies…
+      - name: "⚙️ Installing dependencies…"
         run: bun install
 
-      - name: Apply insert-pluginloader.js codemod
+      - name: "🔧 Apply insert-pluginloader.js codemod"
         run: bun run jscodeshift \
           --parser=tsx \
           --extensions=tsx,ts,js,jsx \
           -t codemods/insert-pluginloader.js \
           client/src/main.jsx
 
-      - name: Apply insert-vite-config.js codemod
+      - name: "🔧 Apply insert-vite-config.js codemod"
         run: bun run jscodeshift \
           --parser=tsx \
           --extensions=ts,tsx,js,jsx \
           -t codemods/insert-vite-config.js \
           client/vite.config.ts
 
-      - name: Apply inline-pluginserver-elysia.js codemod
+      - name: "🔧 Apply inline-pluginserver-elysia.js codemod"
         run: bun run jscodeshift \
           --parser=tsx \
           --extensions=ts,tsx,js,jsx \
           -t codemods/inline-pluginserver-elysia.js\
           api/app/index.js
 
-      - name: Apply inject-otel-bun.js codemod
+      - name: "🔧 Apply inject-otel-bun.js codemod"
         run: bun run jscodeshift \
           --parser=tsx \
           --extensions=ts,tsx,js,jsx \
           -t codemods/inject-otel-bun.js \
           api/app/index.js
 
-      - name: Apply replace-fs-with-bun-io.js codemod
+      - name: "🔧 Apply replace-fs-with-bun-io.js codemod"
         run: bun run jscodeshift \
           --parser=tsx \
           --extensions=ts,tsx,js,jsx \
           -t codemods/replace-fs-with-bun-io.js \
           .
 
-      - name: Apply update-index-html.js codemod
+      - name: "🔧 Apply update-index-html.js codemod"
         run: bun run scripts/update-index-html.js
 
-      - name: Clean api/app dependencies
-        run: bun install --cwd api/app        # frontend install
-      - name: Clean client dependencies
-        run: bun install --cwd client        # frontend install
-      - name: Commit & push changes
-        uses: EndBug/add-and-commit@v9.1.4  # latest stable add-and-commit
+      - name: "📂 Clean install of api/app dependencies"
+        run: bun install --cwd api/app
+      - name: "📂 Clean install of client dependencies"
+        run: bun install --cwd client
+      - name: "💾 Commit & push changes"
+        uses: EndBug/add-and-commit@v9.1.4
         with:
           author_name: "github-actions"
           author_email: "actions@github.com"
