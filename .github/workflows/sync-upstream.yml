@@ -31,27 +31,20 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-      - name: Append merge=ours rules (pre-merge)
+      - name: gitattributes protections (pre-merge)
         run: |
-          touch .gitattributes
-          grep -qxF "client/src/plugin-runtime/** merge=ours" .gitattributes || \
-            echo "client/src/plugin-runtime/** merge=ours" >> .gitattributes
-          grep -qxF "plugins/**                   merge=ours" .gitattributes || \
-            echo "plugins/**                   merge=ours" >> .gitattributes
-          grep -qxF "scripts/**                   merge=ours" .gitattributes || \
-            echo "scripts/**                   merge=ours" >> .gitattributes
-          grep -qxF "codemods/**                  merge=ours" .gitattributes || \
-            echo "codemods/**                  merge=ours" >> .gitattributes
+          gitattributepatterns=(
+            "client/src/plugin-runtime/** merge=ours"
+            "plugins/** merge=ours"
+            "scripts/** merge=ours"
+            "codemods/** merge=ours"
+            ".bun-version merge=ours"
+          )
+          for pat in "${gitattributepatterns[@]}"; do
+            grep -qxF "$pat" .gitattributes || echo "$pat" >> .gitattributes
+          done
           git config merge.ours.driver true
-
-      - name: Commit .gitattributes (pre-merge)
-        uses: EndBug/add-and-commit@v9.1.4
-        with:
-          author_name: github-actions
-          author_email: actions@github.com
-          message: "chore: protect custom folders via merge=ours (pre-merge)"
-          files: .gitattributes
-          push: false
+          git add .gitattributes && git commit -m "chore: .gitattributes merge=ours pre-merge" || true
       - name: update upstream remote & merge
         run: |
           git fetch upstream main
@@ -60,59 +53,71 @@ jobs:
           git merge upstream/main -m "chore: merge upstream/main into fork"
       - name: Append merge=ours rules (post-merge)
         run: |
-          touch .gitattributes
-          grep -qxF "client/src/plugin-runtime/** merge=ours" .gitattributes || \
-            echo "client/src/plugin-runtime/** merge=ours" >> .gitattributes
-          grep -qxF "plugins/**                   merge=ours" .gitattributes || \
-            echo "plugins/**                   merge=ours" >> .gitattributes
-          grep -qxF "scripts/**                   merge=ours" .gitattributes || \
-            echo "scripts/**                   merge=ours" >> .gitattributes
-          grep -qxF "codemods/**                  merge=ours" .gitattributes || \
-            echo "codemods/**                  merge=ours" >> .gitattributes
+          for pat in "${gitattributepatterns[@]}"; do
+            grep -qxF "$pat" .gitattributes || echo "$pat" >> .gitattributes
+          done
           git config merge.ours.driver true
-
-      - name: Commit .gitattributes (post-merge)
-        uses: EndBug/add-and-commit@v9.1.4
-        with:
-          author_name: github-actions
-          author_email: actions@github.com
-          message: "chore: protect custom folders via merge=ours (post-merge)"
-          files: .gitattributes
-          push: false
+          git add .gitattributes && git commit -m "chore: .gitattributes merge=ours post-merge" || true
       - name: 🔍 Cleaning up JS lockfiles…
         run: find . -maxdepth 2 -type f \( -name 'package-lock.json' -o -name 'yarn.lock' -o -name 'pnpm-lock.yaml' -o -name 'bun.lockb' \) -print -exec rm -f {} +
+        
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
           bun-version-file: '.bun-version'
+          
       - name: Update package.json dependencies
         run: bun run scripts/update-packagejson.js
-      - name: 📦 Installing dependencies…
+        
+      - name: Installing dependencies…
         run: bun install
 
-      - name: Apply frontend codemod
-        run: bun run jscodeshift -t codemods/insert-pluginloader.js         --parser=tsx --extensions=tsx,ts client/src/main.jsx
+      - name: Apply insert-pluginloader.js codemod
+        run: bun run jscodeshift \
+          --parser=tsx \
+          --extensions=tsx,ts,js,jsx \
+          -t codemods/insert-pluginloader.js \
+          client/src/main.jsx
 
-      - name: Apply server codemod
-        run: bun run jscodeshift -t codemods/insert-pluginloader-html.js    --parser=none --extensions=html client/index.html
+      - name: Apply insert-vite-config.js codemod
+        run: bun run jscodeshift \
+          --parser=tsx \
+          --extensions=ts,tsx,js,jsx \
+          -t codemods/insert-vite-config.js \
+          client/vite.config.ts
 
-      - name: Apply frontend codemod
-        run: bun run jscodeshift -t codemods/insert-vite-config.js          --parser=tsx --extensions=ts,tsx client/vite.config.ts
+      - name: Apply inline-pluginserver-elysia.js codemod
+        run: bun run jscodeshift \
+          --parser=tsx \
+          --extensions=ts,tsx,js,jsx \
+          -t codemods/inline-pluginserver-elysia.js\
+          api/app/index.js
 
-      - name: Apply server codemod
-        run: bun run jscodeshift -t codemods/inline-pluginserver-elysia.js  --parser=tsx --extensions=ts,tsx api/app/index.ts
+      - name: Apply inject-otel-bun.js codemod
+        run: bun run jscodeshift \
+          --parser=tsx \
+          --extensions=ts,tsx,js,jsx \
+          -t codemods/inject-otel-bun.js \
+          api/app/index.js
 
-      - name: Apply frontend codemod
-        run: bun run jscodeshift -t codemods/replace-fs-with-bun-io.js      --parser=tsx --extensions=ts,tsx .
+      - name: Apply replace-fs-with-bun-io.js codemod
+        run: bun run jscodeshift \
+          --parser=tsx \
+          --extensions=ts,tsx,js,jsx \
+          -t codemods/replace-fs-with-bun-io.js \
+          .
 
-      - name: Clean install dependencies
-        run: bun install --cwd api/app --production        # frontend install
-      - name: Clean install dependencies
-        run: bun install --cwd client --production        # frontend install
+      - name: Apply update-index-html.js codemod
+        run: bun run scripts/update-index-html.js
+
+      - name: Clean api/app dependencies
+        run: bun install --cwd api/app        # frontend install
+      - name: Clean client dependencies
+        run: bun install --cwd client        # frontend install
       - name: Commit & push changes
         uses: EndBug/add-and-commit@v9.1.4  # latest stable add-and-commit
         with:
           author_name: "github-actions"
           author_email: "actions@github.com"
-          message: "reapply plugin framework + bump deps & lockfiles"
+          message: "chore: bun+elysia full migration + bun-native I/O + OTEL"
           push: true
