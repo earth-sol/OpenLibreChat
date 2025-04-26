@@ -5,21 +5,21 @@ export default function transformer(file, api) {
   const j = api.jscodeshift;
   const root = j(file.source);
 
-  // 1. Remove readFileSync & writeFileSync imports from 'fs'
+  // 1. Remove fs imports if they only imported readFileSync/writeFileSync
   root.find(j.ImportDeclaration, { source: { value: 'fs' } })
     .forEach(path => {
-      const specs = path.node.specifiers.filter(s => {
+      const specifiers = path.node.specifiers.filter(s => {
         const n = s.imported && s.imported.name;
         return n !== 'readFileSync' && n !== 'writeFileSync';
       });
-      if (specs.length === 0) {
+      if (specifiers.length === 0) {
         j(path).remove();
       } else {
-        path.node.specifiers = specs;
+        path.node.specifiers = specifiers;
       }
     });
 
-  // 2. Replace readFileSync(...) → await Bun.file(...).text()
+  // 2. readFileSync(...) → await Bun.file(...).text()
   root.find(j.CallExpression, { callee: { name: 'readFileSync' } })
     .replaceWith(path => {
       const [fileArg] = path.node.arguments;
@@ -34,7 +34,7 @@ export default function transformer(file, api) {
       );
     });
 
-  // 3. Replace writeFileSync(path, data) → await Bun.write(path, data)
+  // 3. writeFileSync(path,data) → await Bun.write(path,data)
   root.find(j.CallExpression, { callee: { name: 'writeFileSync' } })
     .replaceWith(path => {
       const [pathArg, dataArg] = path.node.arguments;
@@ -46,9 +46,8 @@ export default function transformer(file, api) {
       );
     });
 
-  // 4. Wrap top-level code in async IIFE if any `await` was added
-  const hasAwait = root.find(j.AwaitExpression).size() > 0;
-  if (hasAwait) {
+  // 4. Wrap in async IIFE if we added any await
+  if (root.find(j.AwaitExpression).size() > 0) {
     const program = root.get().node;
     program.body = [
       j.expressionStatement(
