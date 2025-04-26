@@ -18,13 +18,13 @@ jobs:
         uses: actions/checkout@v4       # latest stable checkout action
         with:
           fetch-depth: 0
-      - name: Ensure upstream remote
+      - name: Ensure "upstream" remote exists
         run: |
-          if ! git remote get-url upstream; then
-            echo "Upstream not found – adding it now."
-            git remote add upstream https://github.com/danny-avila/LibreChat.git
+          if git remote | grep -q '^upstream$'; then
+            echo "✅ upstream already exists, skipping add."
           else
-            echo "Upstream already exists at: $(git remote get-url upstream)"
+            echo "➕ upstream missing, adding now…"
+            git remote add upstream https://github.com/danny-avila/LibreChat.git
           fi
 
       - name: Configure Git
