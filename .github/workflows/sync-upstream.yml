@@ -52,9 +52,8 @@ jobs:
           message: "chore: protect custom folders via merge=ours (pre-merge)"
           files: .gitattributes
           push: false
-      - name: Add upstream remote & merge
+      - name: update upstream remote & merge
         run: |
-          git remote add upstream https://github.com/danny-avila/LibreChat.git
           git fetch upstream main
           git checkout main
           git pull --ff-only origin main
