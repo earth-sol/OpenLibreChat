@@ -60,8 +60,6 @@ jobs:
               echo "  • $path"
             fi
           done
- 
-      - name: " Fetching upstream and resetting to pristine state..."
         # REQUIRED step
         # Step 2: run the sync action
       - name: "📡 Sync upstream changes"
