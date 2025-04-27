@@ -41,7 +41,7 @@ jobs:
             "codemods"
             ".bun-version"
             "README.md"
-            ".github/workflows"
+            ".github/workflows/sync-upstream.yml"
             "config/config.json"
           )
  
@@ -95,59 +95,6 @@ jobs:
           # clean up temp stash
           rm -rf "$tmp"
 
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version-file: '.bun-version'
-          
-      - name: "📦 Update package.json dependencies"
-        run: bun run scripts/update-packagejson.js
-        
-      - name: "⚙️ Installing dependencies…"
-        run: bun install
-
-      - name: "🔧 Apply insert-pluginloader.js codemod"
-        run: bun run jscodeshift \
-          --parser=tsx \
-          --extensions=tsx,ts,js,jsx \
-          -t codemods/insert-pluginloader.js \
-          client/src/main.jsx
-
-      - name: "🔧 Apply insert-vite-config.js codemod"
-        run: bun run jscodeshift \
-          --parser=tsx \
-          --extensions=ts,tsx,js,jsx \
-          -t codemods/insert-vite-config.js \
-          client/vite.config.ts
-
-      - name: "🔧 Apply inline-pluginserver-elysia.js codemod"
-        run: bun run jscodeshift \
-          --parser=tsx \
-          --extensions=ts,tsx,js,jsx \
-          -t codemods/inline-pluginserver-elysia.js\
-          api/app/index.js
-
-      - name: "🔧 Apply inject-otel-bun.js codemod"
-        run: bun run jscodeshift \
-          --parser=tsx \
-          --extensions=ts,tsx,js,jsx \
-          -t codemods/inject-otel-bun.js \
-          api/app/index.js
-
-      - name: "🔧 Apply replace-fs-with-bun-io.js codemod"
-        run: bun run jscodeshift \
-          --parser=tsx \
-          --extensions=ts,tsx,js,jsx \
-          -t codemods/replace-fs-with-bun-io.js \
-          .
-
-      - name: "🔧 Apply update-index-html.js codemod"
-        run: bun run scripts/update-index-html.js
-
-      - name: "📂 Clean install of api/app dependencies"
-        run: bun install --cwd api/app
-      - name: "📂 Clean install of client dependencies"
-        run: bun install --cwd client
       - name: "💾 Commit & push changes"
         uses: EndBug/add-and-commit@v9.1.4
         with:
