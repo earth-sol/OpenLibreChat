@@ -58,10 +58,10 @@ jobs:
  
       - name: "📡 Fetching upstream and resetting to pristine state..."
         run: |
-          git fetch upstream main
-          git checkout main
-          git reset --hard upstream/main
-          git clean -fdx
+          # git fetch upstream main
+          # git checkout main
+          # git reset --hard upstream/main
+          # git clean -fdx
           git pull --rebase upstream main
  
       - name: "🗑️ Cleaning up JS lockfiles…"
