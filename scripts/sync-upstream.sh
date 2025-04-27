@@ -1,91 +1,82 @@
 #!/usr/bin/env bash
 set -euox pipefail
 
-# Ensure upstream remote exists
-echo "⏳ Ensure upstream remote exists"
-if ! git remote get-url upstream > /dev/null 2>&1; then
-  git remote add upstream https://github.com/danny-avila/LibreChat.git
-fi
-
 # Configure Git identity
 git config user.name "github-actions"
 git config user.email "actions@github.com"
 
-# Pre-merge: idempotently protect custom dirs via merge=ours
-echo "⏳ Pre-merge: idempotently protect custom dirs via merge=ours"
-touch .gitattributes
-_append_if_missing() {
-  grep -qxF "$1" .gitattributes || echo "$1" >> .gitattributes
-}
-_append_if_missing "client/src/plugin-runtime/** merge=ours"
-_append_if_missing "plugins/**                   merge=ours"
-_append_if_missing "scripts/**                   merge=ours"
-_append_if_missing "codemods/**                  merge=ours"
-git config merge.ours.driver true
-git add .gitattributes
-git commit -m "chore: protect custom folders via merge=ours (pre-merge)" \
-  || echo "✅ .gitattributes up-to-date"
+# Ensure upstream remote exists
+echo "⏳ Ensure upstream remote exists"
+if git remote | grep -q '^upstream$'; then
+  echo "✅ upstream already exists, skipping add."
+else
+  echo "➕ upstream missing, adding now…"
+  git remote add upstream https://github.com/danny-avila/LibreChat.git
+fi
 
-# Fetch & merge upstream/main
-echo "⏳ Fetch & merge upstream/main"
+# Defining protectedForkPaths
+protectedForkPaths=(
+  "client/src/plugin-runtime"
+  "plugins"
+  "scripts"
+  "codemods"
+  ".bun-version"
+  "README.md"
+  ".github/workflows/sync-upstream.yml"
+  "config/config.json"
+)
+
+# 🔒 Stashing protected files
+
+tmp=$(mktemp -d)
+for path in "${protectedForkPaths[@]}"; do
+  if [ -e "$path" ]; then
+    mkdir -p "$tmp/$(dirname "$path")"
+    cp -R "$path" "$tmp/$path"
+    echo "  • $path"
+  fi
+done
+
+# 📡 Fetching upstream and resetting to pristine state
+
 git fetch upstream main
 git checkout main
-git pull --ff-only origin main
-git merge upstream/main -m "chore: merge upstream/main into fork"
+git reset --hard upstream/main
+git clean -fdx
 
-# Post-merge: re-apply protection (idempotent)
-echo "⏳ Post-merge: re-apply protection (idempotent)"
-touch .gitattributes
-_append_if_missing "client/src/plugin-runtime/** merge=ours"
-_append_if_missing "plugins/**                   merge=ours"
-_append_if_missing "scripts/**                   merge=ours"
-_append_if_missing "codemods/**                  merge=ours"
-git config merge.ours.driver true
-git add .gitattributes
-git commit -m "chore: protect custom folders via merge=ours (post-merge)" \
-  || echo "✅ .gitattributes intact"
+# 🗑️ Cleaning up JS lockfiles
 
-# Update package.json
-echo "⏳ Update package.json"
-bun run scripts/update-packagejson.js
+find . -maxdepth 4 -type f \( -name 'package-lock.json' -o -name 'yarn.lock' -o -name 'pnpm-lock.yaml' -o -name 'bun.lockb' \) -print -exec rm -f {} +
 
-# Install root deps (including jscodeshift)
-echo "⏳ Install root deps (including jscodeshift)"
-bun install --frozen-lockfile
+# 🔍 Checking for any upstream-provided protected paths
 
-# Apply codemods
-echo "⏳ Apply codemods"
-bun run jscodeshift \
-  -t codemods/insert-pluginloader.js \
-  --parser=tsx --extensions=tsx,ts client/src/main.jsx
+upstream_changed=false
+for path in "${protectedForkPaths[@]}"; do
+  if [ -e "$path" ]; then
+    echo "⚠️  Upstream introduced protected path: $path"
+    upstream_changed=true
+  fi
+done 
+if ! $upstream_changed; then
+  echo "✅ No upstream changes detected in protected paths."
+fi
 
-echo "⏳ Apply codemods"
-bun run jscodeshift \
-  -t codemods/insert-pluginloader-html.js \
-  --parser=none --extensions=html client/index.html
+# 🔄 Restoring protected files from stash
 
-echo "⏳ Apply codemods"
-bun run jscodeshift \
-  -t codemods/insert-vite-config.js \
-  --parser=tsx --extensions=ts,tsx client/vite.config.ts
-
-echo "⏳ Apply codemods"
-bun run jscodeshift \
-  -t codemods/inline-pluginserver-elysia.js \
-  --parser=tsx --extensions=ts,tsx api/app/index.ts
-
-echo "⏳ Apply codemods"
-bun run jscodeshift \
-  -t codemods/replace-fs-with-bun-io.js \
-  --parser=tsx --extensions=ts,tsx .
-
-# Install workspace deps
-echo "⏳ installing api/app deps"
-bun install --cwd api/app --production
-echo "✅ api/app deps installed"
-echo "⏳ installing api/app deps"
-bun install --cwd client  --production
-echo "✅ client deps installed"
+for path in "${protectedForkPaths[@]}"; do
+  # remove whatever upstream put there (if anything)
+  rm -rf "$path"
+  # restore from our stash
+  if [ -e "$tmp/$path" ]; then
+    mkdir -p "$(dirname "$path")"
+    cp -R "$tmp/$path" "$path"
+    echo "   • Restored $path"
+  else
+    echo "   • ⚠️  Missing in stash (was not a protected file?): $path"
+  fi
+done
+# 🗑️ clean up temp stash
+rm -rf "$tmp"
 
 # Stage all changes
 echo "⏳ Stage all changes"
@@ -99,7 +90,7 @@ git add \
   codemods scripts
 echo "✅ all changes staged"
 
-# Final commit & push
+# 💾 Commit & push
 echo "⏳ Final commit"
 git commit -m "chore: reapply plugin framework + bump deps & lockfiles" \
   || echo "✅ nothing to commit"
