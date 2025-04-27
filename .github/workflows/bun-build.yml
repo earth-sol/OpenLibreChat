@@ -1,0 +1,21 @@
+name: Bun Build All
+
+on:
+  workflow_dispatch:
+
+jobs:
+  bun-build-all:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v1
+
+      - name: Install Dependencies
+        run: bun scripts/bun-install-all.js
+
+      - name: Build All Projects
+        run: bun scripts/bun-build-all.js

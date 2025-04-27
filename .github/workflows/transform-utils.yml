@@ -1,0 +1,18 @@
+name: Transform Shell Scripts
+
+on:
+  workflow_dispatch:
+
+jobs:
+  transform-utils:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v1
+
+      - name: Run Codemod for Shell Scripts
+        run: bun scripts/transform-utils.js

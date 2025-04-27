@@ -1,0 +1,67 @@
+# .github/workflows/update-env.yml
+name: Update Env Files
+
+on:
+  workflow_dispatch:
+    inputs:
+      output_path:
+        description: 'Output env file path'
+        required: true
+        default: '.env.updated'
+      input_paths:
+        description: 'Comma-separated input env files (optional)'
+        required: false
+        default: ''
+      strict:
+        description: 'Fail on missing variables'
+        required: false
+        default: false
+        type: boolean
+      dry_run:
+        description: 'Dry-run mode (no file writes)'
+        required: false
+        default: false
+        type: boolean
+      json:
+        description: 'Output JSON of changes'
+        required: false
+        default: false
+        type: boolean
+      fallback:
+        description: 'Fallback value if env var missing'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  update-env:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v1
+
+      - name: Run update-env.js
+        run: |
+          # Split comma-separated input_paths into an array
+          IFS=',' read -r -a files <<< "${{ inputs.input_paths }}"
+          # Build argument string
+          flags=""
+          if [ "${{ inputs.strict }}" = "true" ]; then flags="$flags --strict"; fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then flags="$flags --dry-run"; fi
+          if [ "${{ inputs.json }}" = "true" ]; then flags="$flags --json"; fi
+          if [ -n "${{ inputs.fallback }}" ]; then flags="$flags --fallback=${{ inputs.fallback }}"; fi
+
+          # Assemble full CLI call
+          cmd="bun scripts/update-env.js $flags ${{ inputs.output_path }}"
+          for f in "${files[@]}"; do
+            if [ -n "$f" ]; then
+              cmd="$cmd $f"
+            fi
+          done
+
+          echo "Running: $cmd"
+          eval "$cmd"

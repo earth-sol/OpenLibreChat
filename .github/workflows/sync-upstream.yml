@@ -2,8 +2,8 @@
 name: Sync Upstream
 
 on:
-  schedule:
-    - cron: '0 0 * * *'
+#  schedule:
+#    - cron: '0 0 * * *'
   workflow_dispatch:  # click the button on Github repo!
     inputs:
       sync_test_mode: # Adds a boolean option that appears during manual workflow run for easy test mode config

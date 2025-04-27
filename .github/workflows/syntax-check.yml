@@ -1,0 +1,21 @@
+name: Syntax Check
+
+on:
+  workflow_dispatch:
+
+jobs:
+  syntax-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v1
+
+      - name: Syntax-check all scripts
+        run: |
+          # Find each .js file under scripts/ and run Bun’s syntax checker
+          find scripts -type f -name '*.js' -print0 \
+            | xargs -0 -n1 bun run --check
