@@ -1,6 +1,5 @@
 {
   "pluginServer": {
-    "port": 3000,
     "staticPrefix": "/plugins",
     "pluginsDir": "./plugins"
   },
