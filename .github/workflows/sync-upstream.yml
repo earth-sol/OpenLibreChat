@@ -62,6 +62,7 @@ jobs:
           git checkout main
           git reset --hard upstream/main
           git clean -fdx
+          git pull --rebase upstream main
  
       - name: "🗑️ Cleaning up JS lockfiles…"
         run: find . -maxdepth 2 -type f \( -name 'package-lock.json' -o -name 'yarn.lock' -o -name 'pnpm-lock.yaml' -o -name 'bun.lockb' \) -print -exec rm -f {} +
