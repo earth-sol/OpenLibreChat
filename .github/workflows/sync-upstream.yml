@@ -4,7 +4,12 @@ name: Sync Upstream
 on:
   schedule:
     - cron: '0 0 * * *'
-  workflow_dispatch:
+  workflow_dispatch:  # click the button on Github repo!
+    inputs:
+      sync_test_mode: # Adds a boolean option that appears during manual workflow run for easy test mode config
+        description: 'Fork Sync Test Mode'
+        type: boolean
+        default: false
 
 permissions:
   contents: write # needed to push commits
@@ -56,13 +61,33 @@ jobs:
             fi
           done
  
-      - name: "📡 Fetching upstream and resetting to pristine state..."
-        run: |
-          # git fetch upstream main
-          # git checkout main
-          # git reset --hard upstream/main
-          # git clean -fdx
-          git pull --rebase upstream main
+      - name: " Fetching upstream and resetting to pristine state..."
+        # REQUIRED step
+        # Step 2: run the sync action
+      - name: "📡 Sync upstream changes"
+        id: sync
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4.1
+        with:
+          target_sync_branch: main
+          # REQUIRED 'target_repo_token' exactly like this!
+          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
+          upstream_sync_branch: main
+          upstream_sync_repo: danny-avila/LibreChat
+          # upstream_repo_access_token: ${{ secrets.UPSTREAM_REPO_SECRET }}
+          # Set test_mode true during manual dispatch to run tests instead of the true action!!
+          # test_mode: ${{ inputs.sync_test_mode }}
+
+        # Step 3: Display a sample message based on the sync output var 'has_new_commits'
+      - name: New commits found
+        if: steps.sync.outputs.has_new_commits == 'true'
+        run: echo "New commits were found to sync."
+
+      - name: No new commits
+        if: steps.sync.outputs.has_new_commits == 'false'
+        run: echo "There were no new commits."
+
+      - name: Show value of 'has_new_commits'
+        run: echo ${{ steps.sync.outputs.has_new_commits }}
  
       - name: "🗑️ Cleaning up JS lockfiles…"
         run: find . -maxdepth 2 -type f \( -name 'package-lock.json' -o -name 'yarn.lock' -o -name 'pnpm-lock.yaml' -o -name 'bun.lockb' \) -print -exec rm -f {} +
@@ -99,6 +124,7 @@ jobs:
       - name: "💾 Commit & push changes"
         uses: EndBug/add-and-commit@v9.1.4
         with:
+          add: .
           author_name: "github-actions"
           author_email: "actions@github.com"
           message: "chore: sync upstream complete"
