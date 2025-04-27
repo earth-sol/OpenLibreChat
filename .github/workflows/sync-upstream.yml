@@ -100,5 +100,6 @@ jobs:
         with:
           author_name: "github-actions"
           author_email: "actions@github.com"
-          message: "chore: bun+elysia full migration + bun-native I/O + OTEL"
+          message: "chore: sync upstream complete"
           push: true
+          tag_push: '--force'
