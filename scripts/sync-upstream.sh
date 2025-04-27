@@ -80,19 +80,12 @@ rm -rf "$tmp"
 
 # Stage all changes
 echo "⏳ Stage all changes"
-git add \
-  .gitattributes \
-  client/src/main.jsx client/index.html client/vite.config.ts \
-  api/app/index.js \
-  package.json package-lock.json \
-  api/app/package.json api/app/package-lock.json \
-  client/package.json client/package-lock.json \
-  codemods scripts
+git add .
 echo "✅ all changes staged"
 
 # 💾 Commit & push
 echo "⏳ Final commit"
-git commit -m "chore: reapply plugin framework + bump deps & lockfiles" \
+git commit -m "chore: sync from upstream" \
   || echo "✅ nothing to commit"
 echo "⏳ Final push"
 git push origin main --force
