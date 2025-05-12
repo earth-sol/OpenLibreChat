@@ -1,221 +1,203 @@
 #!/usr/bin/env bun
+
 /**
- * codemods/transform-prettier-config.js
+ * transform-prettier-config.js
  *
- * Pure Bun-native jscodeshift transformer (no Node imports).
- * Ensures in any Prettier config:
- *   • singleQuote: true
- *   • semi: true
- *   • bracketSpacing: true
- *   • a TS/TSX override with parser="typescript"
- *
- * Idempotent and logs debug/info to the console.
+ * - Scans repo for Prettier config files via Bun.Glob:
+ *     \*\*\/.prettierrc
+ *     \*\*\/.prettierrc.{json,js,cjs,mjs}
+ *     \*\*\/prettier.config.{js,cjs,mjs}
+ * - CLI flags:
+ *     --dry-run, --dry       Preview changes
+ *     --quiet, --silent      Suppress logs
+ *     -h, --help             Show this help
+ * - Idempotent for JS configs: skips files containing "// bun: prettier-config-updated"
+ * - Ensures:
+ *     • singleQuote: true
+ *     • semi: false
+ *     • bracketSpacing: true
+ *     • parser: "typescript"
+ * - JSON configs updated in-place via JSON.parse/stringify
+ * - JS configs transformed via jscodeshift AST, preserving formatting
+ * - Fully async I/O, per-file try/catch, summary at end, uses Bun.exit
  */
 
-import jscodeshift from 'jscodeshift'
+import { Glob } from "bun";
+import path from "path";
+import j from "jscodeshift";
 
-export default function transformer(fileInfo, api) {
-  const { path: filePath, source } = fileInfo;
-  // support either api.jscodeshift or imported one
-  const j = api.jscodeshift || jscodeshift;
-  const printOpts = { quote: 'single', trailingComma: true };
+async function main() {
+  const args   = Bun.argv.slice(1);
+  const dryRun = args.includes("--dry-run") || args.includes("--dry");
+  const quiet  = args.includes("--quiet")  || args.includes("--silent");
+  const help   = args.includes("-h")       || args.includes("--help");
+  if (help) {
+    console.log(`
+Usage: transform-prettier-config.js [options]
 
-  console.debug(`[transform-prettier-config] ▶️  Processing ${filePath}`);
+Options:
+  --dry-run, --dry       Preview changes without writing
+  --quiet, --silent      Suppress output
+  -h, --help             Show this help
+`);
+    Bun.exit(0);
+  }
 
-  // Is it JSON? (.prettierrc or *.json)
-  const name = filePath.split('/').pop();
-  const isJson = name === '.prettierrc' || name.toLowerCase().endsWith('.json');
+  const log   = (...m) => { if (!quiet) console.log(...m) };
+  const error = (...m) => console.error(...m);
 
-  if (isJson) {
-    // ---- JSON-based config ----
-    let cfg;
-    try {
-      cfg = JSON.parse(source);
-    } catch (err) {
-      console.error(`[transform-prettier-config] ❌ JSON parse error in ${filePath}: ${err.message}`);
-      return null;
-    }
+  log("▶ transform-prettier-config: starting", dryRun ? "(dry-run)" : "");
 
-    let changed = false;
-    // enforce core options
-    if (cfg.singleQuote    !== true) { cfg.singleQuote    = true;    changed = true }
-    if (cfg.semi           !== true) { cfg.semi           = true;    changed = true }
-    if (cfg.bracketSpacing !== true) { cfg.bracketSpacing = true;    changed = true }
+  const MARKER    = "// bun: prettier-config-updated";
+  const PATTERNS  = [
+    "**/.prettierrc",
+    "**/.prettierrc.json",
+    "**/.prettierrc.js",
+    "**/.prettierrc.cjs",
+    "**/.prettierrc.mjs",
+    "**/prettier.config.js",
+    "**/prettier.config.cjs",
+    "**/prettier.config.mjs"
+  ];
 
-    // ensure overrides array exists
-    if (!Array.isArray(cfg.overrides)) {
-      cfg.overrides = []; changed = true;
-    }
+  const rootUrl = new URL("../../LibreChat-main", import.meta.url);
+  const root    = Bun.fileURLToPath(rootUrl);
 
-    // prepare TS override
-    const tsOverride = {
-      files: ['*.ts','*.tsx','*.mts','*.cts'],
-      options: { parser: 'typescript' }
-    };
+  let processed = 0, failed = 0;
 
-    const hasTs = cfg.overrides.some(o =>
-      Array.isArray(o.files) &&
-      o.files.some(f => f.endsWith('.ts') || f.endsWith('.tsx'))
-    );
+  for (const pat of PATTERNS) {
+    const glob = new Glob(pat);
+    for await (const rel of glob.scan({ cwd: root, absolute: false, onlyFiles: true })) {
+      processed++;
+      const abs = path.join(root, rel);
+      log(`\n→ ${rel}`);
 
-    if (!hasTs) {
-      cfg.overrides.push(tsOverride);
-      changed = true;
-    } else {
-      // enforce parser in existing override
-      cfg.overrides = cfg.overrides.map(o => {
-        if (Array.isArray(o.files) &&
-            o.files.some(f => f.endsWith('.ts')||f.endsWith('.tsx')) &&
-            o.options?.parser !== 'typescript'
-        ) {
-          return { ...o, options: { ...o.options, parser: 'typescript' } };
+      let src;
+      try {
+        src = await Bun.file(abs).text();
+      } catch (err) {
+        error("  ❌ read failed:", err.message);
+        failed++;
+        continue;
+      }
+
+      let out = src;
+      let modified = false;
+
+      // JSON-based config (.prettierrc or .json)
+      if (rel.endsWith(".json") || rel.endsWith(".prettierrc")) {
+        let cfg;
+        try {
+          cfg = JSON.parse(src);
+        } catch (err) {
+          error("  ❌ JSON parse failed:", err.message);
+          failed++;
+          continue;
         }
-        return o;
-      });
-    }
 
-    if (changed) {
-      console.info(`[transform-prettier-config] ✔ Updated JSON: ${filePath}`);
-      return JSON.stringify(cfg, null, 2) + '\n';
-    } else {
-      console.debug(`[transform-prettier-config] ✅ No change JSON: ${filePath}`);
-      return null;
-    }
-  }
+        // enforce settings
+        if (cfg.singleQuote !== true) {
+          cfg.singleQuote = true; modified = true; log("  ✓ singleQuote = true");
+        }
+        if (cfg.semi !== false) {
+          cfg.semi = false; modified = true; log("  ✓ semi = false");
+        }
+        if (cfg.bracketSpacing !== true) {
+          cfg.bracketSpacing = true; modified = true; log("  ✓ bracketSpacing = true");
+        }
+        if (cfg.parser !== "typescript") {
+          cfg.parser = "typescript"; modified = true; log('  ✓ parser = "typescript"');
+        }
 
-  // ---- JS-based config ----
-  let root;
-  try {
-    root = j(source);
-  } catch (err) {
-    console.error(`[transform-prettier-config] ❌ AST parse error in ${filePath}: ${err.message}`);
-    return null;
-  }
+        if (!modified) {
+          log("  ↪ no changes");
+          continue;
+        }
 
-  // locate the object literal
-  let objPath = null;
-  // module.exports = { ... }
-  root.find(j.AssignmentExpression, {
-    left: { object: { name: 'module' }, property: { name: 'exports' } }
-  }).forEach(p => {
-    if (p.node.right.type === 'ObjectExpression') {
-      objPath = p.get('right');
-    }
-  });
-  // export default { ... }
-  if (!objPath) {
-    root.find(j.ExportDefaultDeclaration).forEach(p => {
-      if (p.node.declaration.type === 'ObjectExpression') {
-        objPath = p.get('declaration');
+        out = JSON.stringify(cfg, null, 2) + "\n";
       }
-    });
-  }
-
-  if (!objPath) {
-    console.debug(`[transform-prettier-config] ✅ No config object in: ${filePath}`);
-    return null;
-  }
-
-  let mutated = false;
-
-  // helper: set or update a property
-  const setProp = (key, valNode) => {
-    const props = objPath.node.properties;
-    const existing = props.find(p =>
-      ((p.key.type==='Identifier' && p.key.name===key) ||
-       (p.key.type==='Literal'    && p.key.value===key))
-    );
-    if (existing) {
-      const oldSrc = j(existing.value).toSource();
-      const newSrc = j(valNode).toSource();
-      if (oldSrc !== newSrc) {
-        existing.value = valNode;
-        mutated = true;
-      }
-    } else {
-      props.unshift(j.property('init', j.identifier(key), valNode));
-      mutated = true;
-    }
-  };
-
-  // enforce defaults
-  setProp('singleQuote',    j.literal(true));
-  setProp('semi',           j.literal(true));
-  setProp('bracketSpacing', j.literal(true));
-
-  // AST node for TS override
-  const tsOverrideNode = j.objectExpression([
-    j.property('init', j.identifier('files'),
-      j.arrayExpression(
-        ['*.ts','*.tsx','*.mts','*.cts'].map(str => j.literal(str))
-      )
-    ),
-    j.property('init', j.identifier('options'),
-      j.objectExpression([
-        j.property('init', j.identifier('parser'), j.literal('typescript'))
-      ])
-    )
-  ]);
-
-  // find existing overrides array
-  const overridesProp = objPath.node.properties.find(p =>
-    ((p.key.type==='Identifier' && p.key.name==='overrides') ||
-     (p.key.type==='Literal'    && p.key.value==='overrides')) &&
-    p.value.type==='ArrayExpression'
-  );
-
-  if (overridesProp) {
-    const arr = overridesProp.value.elements;
-    let found = false;
-    arr.forEach(el => {
-      if (el?.type === 'ObjectExpression') {
-        const filesProp = el.properties.find(p =>
-          ((p.key.type==='Identifier' && p.key.name==='files') ||
-           (p.key.type==='Literal'    && p.key.value==='files')) &&
-          p.value.type==='ArrayExpression'
+      // JS-based config
+      else {
+        if (src.includes(MARKER)) {
+          log("  ↪ already transformed");
+          continue;
+        }
+        const ast = j(src);
+        // insert marker
+        ast.get().node.program.body.unshift(
+          j.commentLine(" bun: prettier-config-updated", true, false)
         );
-        if (filesProp &&
-            filesProp.value.elements.some(f => /\.tsx?$/.test(f.value))
-        ) {
-          found = true;
-          // ensure parser exists
-          const opts = el.properties.find(p =>
-            ((p.key.type==='Identifier' && p.key.name==='options') ||
-             (p.key.type==='Literal'    && p.key.value==='options'))
-          );
-          if (opts && opts.value.type==='ObjectExpression') {
-            const hasParser = opts.value.properties.some(p =>
-              ((p.key.type==='Identifier' && p.key.name==='parser') ||
-               (p.key.type==='Literal'    && p.key.value==='parser'))
+        modified = true;
+
+        // find the config object literal
+        let obj = null;
+        ast.find(j.ExportDefaultDeclaration).forEach(p => {
+          if (j.ObjectExpression.check(p.node.declaration)) obj = p.node.declaration;
+        });
+        ast.find(j.AssignmentExpression, {
+          left: { object: { name: "module" }, property: { name: "exports" } }
+        }).forEach(p => {
+          if (j.ObjectExpression.check(p.node.right)) obj = p.node.right;
+        });
+
+        if (!obj) {
+          log("  ⚠ config object not found; skipping AST transform");
+          out = src;
+        } else {
+          // helper to ensure or update a property
+          function upsertProp(name, valueNode) {
+            const prop = obj.properties.find(p =>
+              j.ObjectProperty.check(p) &&
+              ((j.Identifier.check(p.key) && p.key.name === name) ||
+               (j.Literal.check(p.key) && p.key.value === name))
             );
-            if (!hasParser) {
-              opts.value.properties.push(
-                j.property('init', j.identifier('parser'), j.literal('typescript'))
+            if (prop) {
+              if (!j.Literal.check(prop.value) ||
+                  prop.value.value !== valueNode.value) {
+                prop.value = valueNode;
+                log(`  ✓ updated ${name}`);
+              }
+            } else {
+              obj.properties.push(
+                j.objectProperty(j.identifier(name), valueNode)
               );
-              mutated = true;
+              log(`  ✓ added ${name}`);
             }
           }
+
+          upsertProp("singleQuote", j.literal(true));
+          upsertProp("semi", j.literal(false));
+          upsertProp("bracketSpacing", j.literal(true));
+          upsertProp("parser", j.literal("typescript"));
+
+          out = ast.toSource({
+            reuseWhitespace: true,
+            quote: "single",
+            trailingComma: true
+          });
         }
       }
-    });
-    if (!found) {
-      arr.push(tsOverrideNode);
-      mutated = true;
+
+      if (dryRun) {
+        log("  (dry-run) changes detected");
+        continue;
+      }
+
+      try {
+        await Bun.write(abs, out);
+        log("  ✔ written");
+      } catch (err) {
+        error("  ❌ write failed:", err.message);
+        failed++;
+      }
     }
-  } else {
-    objPath.node.properties.unshift(
-      j.property('init', j.identifier('overrides'),
-        j.arrayExpression([tsOverrideNode])
-      )
-    );
-    mutated = true;
   }
 
-  if (!mutated) {
-    console.debug(`[transform-prettier-config] ✅ No change JS: ${filePath}`);
-    return null;
-  }
-
-  console.info(`[transform-prettier-config] ✔ Updated JS: ${filePath}`);
-  return root.toSource(printOpts);
+  log(`\n✔ transform-prettier-config: processed=${processed}, failed=${failed}`);
+  if (failed) Bun.exit(1);
 }
+
+main().catch(err => {
+  console.error("‼ transform-prettier-config crashed:", err);
+  Bun.exit(1);
+});

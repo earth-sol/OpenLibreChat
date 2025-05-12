@@ -1,102 +1,146 @@
 #!/usr/bin/env bun
+
 /**
  * transform-devcontainer.js
  *
- * A Bun-native script to update .devcontainer/devcontainer.json:
- *  - Ensure forwardPorts includes 3080 & 3090
- *  - Set postCreateCommand to "bun install"
- *  - Add ms-vscode.vscode-typescript-tslint-plugin to customizations.vscode.extensions
- *  - Preserve all other properties
- *
- * Usage:
- *   bun codemods/transform-devcontainer.js [path/to/devcontainer.json]
- *
- * Defaults:
- *   path = "./.devcontainer/devcontainer.json"
- *
- * Debug logging enabled by default; disable with DEBUG_LOGGING=false or --quiet.
+ * - Scans `.devcontainer/devcontainer.json` via Bun.Glob
+ * - Ensures:
+ *    • `forwardPorts` includes [3080, 3090]
+ *    • `postCreateCommand` is "bun install"
+ *    • `customizations.vscode.extensions` contains "ms-vscode.vscode-typescript-tslint-plugin"
+ * - Idempotent: skips files already marked
+ * - CLI flags:
+ *     --dry-run    preview without writing
+ *     --quiet      suppress logs
+ *     --silent     alias for --quiet
+ *     -h, --help   show this help
+ * - Uses Bun.Core for I/O and Glob; uses Bun.exit on failure
  */
 
-const USAGE = `
-Usage: bun transform-devcontainer.js [path/to/devcontainer.json]
+import { Glob } from "bun";
+import path from "path";
 
-  If no path is provided, defaults to "./.devcontainer/devcontainer.json".
-  Enable/disable debug logs via DEBUG_LOGGING env (true/false) or --quiet flag.
-`;
+async function main() {
+  const args   = Bun.argv.slice(1);
+  const dryRun = args.includes("--dry")    || args.includes("--dry-run");
+  const quiet  = args.includes("--quiet")  || args.includes("--silent");
+  const help   = args.includes("-h")       || args.includes("--help");
+  if (help) {
+    console.log(`
+Usage: transform-devcontainer.js [options]
 
-(async () => {
-  try {
-    const args = process.argv.slice(2);
-    if (args.includes('-h') || args.includes('--help')) {
-      console.log(USAGE.trim());
-      return;
-    }
-
-    const QUIET = args.includes('--quiet') || Bun.env.DEBUG_LOGGING === 'false';
-    const log = (...msgs) => !QUIET && console.log('[devcontainer]', ...msgs);
-    const warn = (...msgs) => console.warn('[devcontainer WARN]', ...msgs);
-
-    // Determine file path
-    const rawPath = args[0] || new URL('../.devcontainer/devcontainer.json', import.meta.url).pathname;
-    const fileUrl = rawPath.startsWith('file://') ? new URL(rawPath) : new URL(`file://${Bun.pathToFileURL(rawPath)}`);
-    const filePath = Bun.fileURLToPath(fileUrl);
-
-    log('▶ Target file:', filePath);
-
-    // Read & parse
-    let json;
-    try {
-      const text = await (await Bun.file(fileUrl)).text();
-      json = JSON.parse(text);
-    } catch (err) {
-      warn('Cannot read or parse JSON:', err.message);
-      return;
-    }
-
-    // 1) forwardPorts
-    const NEED_PORTS = [3080, 3090];
-    if (!Array.isArray(json.forwardPorts)) {
-      log('Adding forwardPorts →', NEED_PORTS);
-      json.forwardPorts = NEED_PORTS.slice();
-    } else {
-      const ports = new Set(json.forwardPorts);
-      NEED_PORTS.forEach((p) => {
-        if (!ports.has(p)) {
-          log(`➕ Including port ${p}`);
-          ports.add(p);
-        }
-      });
-      json.forwardPorts = Array.from(ports).sort((a, b) => a - b);
-    }
-
-    // 2) postCreateCommand
-    const CMD = 'bun install';
-    if (json.postCreateCommand !== CMD) {
-      log('Setting postCreateCommand →', CMD);
-      json.postCreateCommand = CMD;
-    }
-
-    // 3) customizations.vscode.extensions
-    const EXT = 'ms-vscode.vscode-typescript-tslint-plugin';
-    json.customizations ??= {};
-    json.customizations.vscode ??= {};
-    if (!Array.isArray(json.customizations.vscode.extensions)) {
-      log('Initializing extensions with →', [EXT]);
-      json.customizations.vscode.extensions = [EXT];
-    } else if (!json.customizations.vscode.extensions.includes(EXT)) {
-      log(`➕ Adding extension → ${EXT}`);
-      json.customizations.vscode.extensions.push(EXT);
-    }
-
-    // 4) Preserve other keys (workspaceFolder, features, remoteUser, etc.)
-    log('✅ All other keys preserved');
-
-    // Write back
-    const out = JSON.stringify(json, null, 2) + '\n';
-    await Bun.write(filePath, out);
-    log('✔ Updated', filePath);
-  } catch (fatal) {
-    console.error('[devcontainer FATAL]', fatal);
-    process.exit(1);
+Options:
+  --dry-run, --dry      Preview changes without writing
+  --quiet, --silent     Suppress all output
+  -h, --help            Show this help
+`);
+    Bun.exit(0);
   }
-})();
+
+  const log   = (...m) => { if (!quiet) console.log(...m) };
+  const error = (...m) => console.error(...m);
+
+  log("▶ transform-devcontainer: starting");
+
+  // Marker for idempotence
+  const marker = "bun: devcontainer-updated";
+
+  // Locate .devcontainer folder under LibreChat-main
+  const rootUrl = new URL("../../LibreChat-main/.devcontainer", import.meta.url);
+  const devcRoot = Bun.fileURLToPath(rootUrl);
+
+  // Find all devcontainer.json files
+  const glob = new Glob("devcontainer.json");
+  let processed = 0, failed = 0;
+
+  for await (const rel of glob.scan({ cwd: devcRoot, absolute: false, onlyFiles: true })) {
+    processed++;
+    const filePath = path.join(devcRoot, rel);
+    log(`\n→ ${path.relative(devcRoot, filePath)}`);
+
+    let src;
+    try {
+      src = await Bun.file(filePath).text();
+    } catch (err) {
+      error("  ❌ read failed:", err.message);
+      failed++;
+      continue;
+    }
+
+    // Skip if already transformed
+    if (src.includes(marker)) {
+      log("  ↪ already transformed (marker found)");
+      continue;
+    }
+
+    let cfg;
+    try {
+      cfg = JSON.parse(src);
+    } catch (err) {
+      error("  ❌ JSON parse failed:", err.message);
+      failed++;
+      continue;
+    }
+
+    let changed = false;
+
+    // Ensure forwardPorts
+    cfg.forwardPorts = Array.isArray(cfg.forwardPorts) ? cfg.forwardPorts : [];
+    [3080, 3090].forEach(port => {
+      if (!cfg.forwardPorts.includes(port)) {
+        cfg.forwardPorts.push(port);
+        changed = true;
+        log(`   ✓ added forwardPort ${port}`);
+      }
+    });
+
+    // Ensure postCreateCommand
+    if (cfg.postCreateCommand !== "bun install") {
+      cfg.postCreateCommand = "bun install";
+      changed = true;
+      log(`   ✓ set postCreateCommand to "bun install"`);
+    }
+
+    // Ensure customizations.vscode.extensions
+    cfg.customizations = cfg.customizations || {};
+    cfg.customizations.vscode = cfg.customizations.vscode || {};
+    cfg.customizations.vscode.extensions = Array.isArray(cfg.customizations.vscode.extensions)
+      ? cfg.customizations.vscode.extensions
+      : [];
+    const ext = "ms-vscode.vscode-typescript-tslint-plugin";
+    if (!cfg.customizations.vscode.extensions.includes(ext)) {
+      cfg.customizations.vscode.extensions.push(ext);
+      changed = true;
+      log(`   ✓ added VSCode extension ${ext}`);
+    }
+
+    if (!changed) {
+      log("  ↪ no changes needed");
+      continue;
+    }
+
+    // Serialize with marker at top
+    const out = `/* ${marker} */\n` +
+      JSON.stringify(cfg, null, 2) + "\n";
+
+    if (dryRun) {
+      log("  (dry-run) changes detected");
+    } else {
+      try {
+        await Bun.write(filePath, out);
+        log("  ✔ written");
+      } catch (err) {
+        error("  ❌ write failed:", err.message);
+        failed++;
+      }
+    }
+  }
+
+  log(`\n✔ transform-devcontainer: processed=${processed}, failed=${failed}`);
+  if (failed) Bun.exit(1);
+}
+
+main().catch(err => {
+  console.error("‼ transform-devcontainer crashed:", err);
+  Bun.exit(1);
+});

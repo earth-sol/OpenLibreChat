@@ -1,178 +1,290 @@
+#!/usr/bin/env bun
+
 /**
- * codemods/transform-security-middleware.js
+ * scripts/transform-security-middleware.js
  *
- * 1) CJS → ESM for helmet, rateLimit, mongo-sanitize
- * 2) Rename rate-limit keys: windowMs→window, max→limit
- * 3) app.use(sanitize()) → app.hook('preHandler', sanitize())
- * 4) Bun-friendly (ESM), verbose debug logging
+ * A Bun-native CLI codemod that converts Express security middleware
+ * (helmet, express-rate-limit, express-mongo-sanitize) to Elysia plugins:
+ *
+ *  • Idempotent via "// bun: security-mw-updated" marker
+ *  • Unified on jscodeshift.withParser('ts') for TS/JSX support
+ *  • True alias detection for both ESM imports and CJS requires
+ *  • Data-driven plugin mappings & hook stages via CLI flags
+ *  • Merges import injection, option renames, and hook rewrites in one pass
+ *  • Cleans up legacy imports/requires and unused modules
+ *  • Supports --dry-run/-d, --quiet/-q, --root=<dir>, --sanitize-hook=<hookName>
  */
 
-export default function transformer(fileInfo, { jscodeshift: j }) {
-  const root = j(fileInfo.source);
-  let didTransform = false;
+import { Glob } from 'bun';
+import jscodeshiftPkg from 'jscodeshift';
+import path from 'path';
 
-  // Helpers to track found identifiers
-  let helmetId = null;
-  let rateLimitId = null;
-  let sanitizeId = null;
+const args               = Bun.argv.slice(1);
+const dryRun             = args.includes('--dry-run') || args.includes('-d');
+const quiet              = args.includes('--quiet')    || args.includes('-q');
+const rootFlag           = args.find(a => a.startsWith('--root='));
+const baseDir            = rootFlag ? rootFlag.split('=')[1] : process.cwd();
+const sanitizeHookFlag   = args.find(a => a.startsWith('--sanitize-hook='));
+const sanitizeHook       = sanitizeHookFlag ? sanitizeHookFlag.split('=')[1] : 'preHandler';
 
-  // 1) FIND & REMOVE CJS requires, COLLECT local names
-  root
-    .find(j.VariableDeclaration)
-    .filter(path => {
-      const decl = path.node.declarations[0];
-      return (
-        decl.init?.type === 'CallExpression' &&
-        decl.init.callee.name === 'require' &&
-        ['helmet', 'express-rate-limit', 'express-mongo-sanitize'].includes(
-          decl.init.arguments[0].value
-        )
-      );
-    })
-    .forEach(path => {
-      const decl = path.node.declarations[0];
-      const pkg = decl.init.arguments[0].value;
-      const localName = decl.id.type === 'ObjectPattern'
-        ? decl.id.properties[0].value.name
-        : decl.id.name;
+const log   = (...m) => !quiet && console.log(...m);
+const debug = (...m) => !quiet && console.debug('[transform-security-mw]', ...m);
 
-      console.debug(
-        `[transform-security-middleware][DEBUG] removing require('${pkg}') from ${fileInfo.path}`
-      );
-
-      if (pkg === 'helmet') helmetId = localName;
-      if (pkg === 'express-rate-limit') rateLimitId = localName;
-      if (pkg === 'express-mongo-sanitize') sanitizeId = localName;
-
-      j(path).remove(); // remove the entire `const ... = require(...)`
-      didTransform = true;
-    });
-
-  // 2) INSERT ESM imports at top in correct order
-  const firstImport = root.find(j.ImportDeclaration).at(0);
-  const insertBefore = firstImport.size() ? firstImport.get() : null;
-
-  const importDecls = [];
-  if (helmetId) {
-    importDecls.push(
-      j.importDeclaration(
-        [j.importSpecifier(j.identifier('helmet'), j.identifier(helmetId))],
-        j.literal('@elysia/helmet')
-      )
-    );
+// Plugin definitions in desired insertion order
+const plugins = [
+  {
+    pkg: '@elysia/helmet',
+    importName: 'helmet',
+    hook: 'onRequest',
+    typeOnly: true,
+    optionsRename: null
+  },
+  {
+    pkg: '@elysia/rate-limit',
+    importName: 'rateLimit',
+    hook: 'onRequest',
+    typeOnly: true,
+    optionsRename: { windowMs: 'window', max: 'limit' }
+  },
+  {
+    pkg: 'express-mongo-sanitize',
+    importName: 'default',
+    hook: sanitizeHook,
+    typeOnly: false,
+    optionsRename: null
   }
-  if (rateLimitId) {
-    importDecls.push(
-      j.importDeclaration(
-        [j.importSpecifier(j.identifier('rateLimit'), j.identifier(rateLimitId))],
-        j.literal('@elysia/rate-limit')
-      )
-    );
-  }
-  if (sanitizeId) {
-    importDecls.push(
-      j.importDeclaration(
-        [j.importDefaultSpecifier(j.identifier(sanitizeId))],
-        j.literal('express-mongo-sanitize')
-      )
-    );
-  }
+];
 
-  if (importDecls.length) {
-    console.debug(
-      `[transform-security-middleware][DEBUG] injecting ESM imports into ${fileInfo.path}`
-    );
-    importDecls.reverse().forEach(imp => {
-      if (insertBefore) j(insertBefore).insertBefore(imp);
-      else root.get().node.program.body.unshift(imp);
-    });
-    didTransform = true;
-  }
-
-  // 3) RENAME rateLimit OPTION KEYS
-  if (rateLimitId) {
-    // a) Direct call: rateLimit({ windowMs, max, ... })
-    root
-      .find(j.CallExpression, { callee: { name: rateLimitId } })
-      .filter(p => p.node.arguments[0]?.type === 'ObjectExpression')
-      .forEach(p => {
-        const obj = p.node.arguments[0];
-        obj.properties.forEach(prop => {
-          if (prop.key.name === 'windowMs') {
-            console.debug(
-              `[transform-security-middleware][DEBUG] renaming windowMs→window in ${fileInfo.path}`
-            );
-            prop.key.name = 'window';
-          }
-          if (prop.key.name === 'max') {
-            console.debug(
-              `[transform-security-middleware][DEBUG] renaming max→limit in ${fileInfo.path}`
-            );
-            prop.key.name = 'limit';
-          }
-        });
-        didTransform = true;
-      });
-
-    // b) limiterOptions = { windowMs, max, … }
-    root
-      .find(j.VariableDeclarator, { id: { name: 'limiterOptions' } })
-      .filter(p => p.node.init?.type === 'ObjectExpression')
-      .forEach(p => {
-        p.node.init.properties.forEach(prop => {
-          if (
-            prop.key.name === 'windowMs' &&
-            prop.shorthand
-          ) {
-            console.debug(
-              `[transform-security-middleware][DEBUG] renaming limiterOptions.windowMs→window in ${fileInfo.path}`
-            );
-            prop.key.name = 'window';
-            prop.shorthand = false;
-          }
-          if (
-            prop.key.name === 'max' &&
-            prop.shorthand
-          ) {
-            console.debug(
-              `[transform-security-middleware][DEBUG] renaming limiterOptions.max→limit in ${fileInfo.path}`
-            );
-            prop.key.name = 'limit';
-            prop.shorthand = false;
-          }
-        });
-        didTransform = true;
-      });
-  }
-
-  // 4) CONVERT app.use(sanitize()) → app.hook('preHandler', sanitize())
-  if (sanitizeId) {
-    root
-      .find(j.ExpressionStatement, {
-        expression: {
-          type: 'CallExpression',
-          callee: { object: { name: 'app' }, property: { name: 'use' } },
-        },
-      })
-      .filter(path => {
-        const arg = path.node.expression.arguments[0];
-        return (
-          arg?.type === 'CallExpression' &&
-          arg.callee.name === sanitizeId
-        );
-      })
-      .forEach(path => {
-        console.debug(
-          `[transform-security-middleware][DEBUG] converting app.use(${sanitizeId}()) → app.hook('preHandler', ${sanitizeId}()) in ${fileInfo.path}`
-        );
-        const newExpr = j.callExpression(
-          j.memberExpression(j.identifier('app'), j.identifier('hook')),
-          [j.literal('preHandler'), j.callExpression(j.identifier(sanitizeId), [])]
-        );
-        j(path).replaceWith(j.expressionStatement(newExpr));
-        didTransform = true;
-      });
-  }
-
-  return didTransform ? root.toSource({ quote: 'single' }) : null;
+function removeImport(root, j, mod) {
+  const imps = root.find(j.ImportDeclaration, { source: { value: mod } });
+  if (imps.size()) { imps.remove(); debug(`removed import '${mod}'`); return true; }
+  return false;
 }
+
+function removeRequire(root, j, mod) {
+  const calls = root.find(j.CallExpression, {
+    callee: { name: 'require' },
+    arguments: [{ value: mod }]
+  });
+  if (calls.size()) {
+    calls.forEach(p => j(p).parent.remove());
+    debug(`removed require('${mod}')`);
+    return true;
+  }
+  return false;
+}
+
+function findAlias(root, j, pkg, importName) {
+  let alias = null;
+  // ESM import
+  root.find(j.ImportDeclaration, { source: { value: pkg } }).forEach(p => {
+    p.node.specifiers.forEach(spec => {
+      if (
+        (importName === 'default' && spec.type === 'ImportDefaultSpecifier') ||
+        (spec.type === 'ImportSpecifier' && spec.imported.name === importName)
+      ) {
+        alias = spec.local.name;
+      }
+    });
+  });
+  if (alias) return alias;
+  // CJS require
+  root.find(j.VariableDeclarator, {
+    init: {
+      type: 'CallExpression',
+      callee: { name: 'require' },
+      arguments: [{ value: pkg }]
+    }
+  }).forEach(p => {
+    if (p.node.id.type === 'Identifier') alias = p.node.id.name;
+  });
+  return alias;
+}
+
+function transform(source, filePath) {
+  if (source.includes('// bun: security-mw-updated')) return null;
+
+  const j    = jscodeshiftPkg.withParser('ts');
+  const root = j(source);
+  let did    = false;
+
+  debug('processing', filePath);
+
+  // 1) idempotency marker
+  root.get().node.program.body.unshift(
+    j.expressionStatement(j.literal('// bun: security-mw-updated'))
+  );
+  did = true;
+
+  // 2) detect plugin aliases & prepare import declarations
+  const importDecls = [];
+  plugins.forEach(plugin => {
+    const { pkg, importName, typeOnly } = plugin;
+    let id = findAlias(root, j, pkg, importName);
+    plugin.alias = id;
+
+    if (!id) {
+      // generate a unique local name
+      id = importName === 'default'
+        ? pkg.split('/').pop()
+        : importName;
+      plugin.alias = id;
+
+      // build import declaration
+      const specifier = importName === 'default'
+        ? j.importDefaultSpecifier(j.identifier(id))
+        : j.importSpecifier(j.identifier(importName), j.identifier(id));
+
+      const decl = j.importDeclaration([specifier], j.literal(pkg));
+      if (typeOnly) decl.importKind = 'type';
+      importDecls.push(decl);
+      debug(`will insert import for '${pkg}' as '${id}'`);
+    }
+  });
+
+  // 3) single AST pass: imports, option-renames, hook-rewrites
+  root.find(j.Program).forEach(p => {
+    j(p).visit({
+      visitImportDeclaration(path) {
+        // remove legacy imports
+        plugins.forEach(({ pkg }) => {
+          if (path.node.source.value === pkg) {
+            path.prune();
+            did = true;
+            debug(`removed legacy import ${pkg}`);
+          }
+        });
+        this.traverse(path);
+      },
+
+      visitVariableDeclarator(path) {
+        // remove require(...) for legacy
+        const init = path.node.init;
+        if (
+          init &&
+          init.type === 'CallExpression' &&
+          init.callee.name === 'require' &&
+          typeof init.arguments[0]?.value === 'string'
+        ) {
+          const pkg = init.arguments[0].value;
+          if (plugins.some(pl => pl.pkg === pkg)) {
+            path.parent.prune();
+            did = true;
+            debug(`removed legacy require ${pkg}`);
+            return false;
+          }
+        }
+        this.traverse(path);
+      },
+
+      visitCallExpression(path) {
+        const { node } = path;
+        // plugin hook & option rename
+        if (
+          node.callee.type === 'MemberExpression' &&
+          node.callee.property.name === 'use' &&
+          node.arguments.length &&
+          node.arguments[0].type === 'CallExpression'
+        ) {
+          const inner = node.arguments[0];
+          const calleeName = inner.callee.name;
+
+          const plugin = plugins.find(pl => pl.alias === calleeName);
+          if (plugin) {
+            did = true;
+            // rename options if any
+            if (plugin.optionsRename && inner.arguments[0]?.type === 'ObjectExpression') {
+              inner.arguments[0].properties.forEach(prop => {
+                if (prop.type === 'Property' && prop.key.type === 'Identifier') {
+                  const newKey = plugin.optionsRename[prop.key.name];
+                  if (newKey) {
+                    prop.key.name = newKey;
+                    debug(`renamed option ${prop.key.name} → ${newKey}`);
+                  }
+                }
+              });
+            }
+            // rewrite app.use → app.<hook>
+            const obj = node.callee.object;
+            path.node.callee = j.memberExpression(
+              obj,
+              j.identifier(plugin.hook)
+            );
+            debug(`rewrote use → ${plugin.hook} for ${calleeName}`);
+          }
+        }
+        this.traverse(path);
+      }
+    });
+  });
+
+  // 4) insert missing imports just after the marker
+  if (importDecls.length) {
+    const prog = root.get().node.program.body;
+    const insertIdx = prog.findIndex(stmt =>
+      stmt.type === 'ExpressionStatement' &&
+      stmt.expression.value === '// bun: security-mw-updated'
+    ) + 1;
+    prog.splice(insertIdx, 0, ...importDecls);
+    did = true;
+  }
+
+  // 5) clean up unused imports: path, url
+  ['path','url'].forEach(mod => {
+    removeImport(root, j, mod) || removeRequire(root, j, mod);
+  });
+
+  return did
+    ? root.toSource({ quote:'single', trailingComma:true })
+    : null;
+}
+
+async function main() {
+  const pattern = path.join(baseDir, '**/*.{js,ts,tsx}');
+  let processed = 0, failed = 0;
+
+  for await (const filePath of new Glob([pattern])) {
+    if (filePath.includes('node_modules') || filePath.endsWith('transform-security-middleware.js'))
+      continue;
+
+    let src;
+    try { src = await Bun.file(filePath).text() }
+    catch (e) {
+      console.error('[security-mw] read failed:', filePath, e.message);
+      failed++; continue;
+    }
+
+    let out;
+    try { out = transform(src, filePath) }
+    catch (e) {
+      console.error('[security-mw] transform error in', filePath, e);
+      failed++; continue;
+    }
+
+    processed++;
+    if (!out) {
+      debug('no changes:', filePath);
+      continue;
+    }
+
+    if (dryRun) {
+      log('DRY', filePath);
+    } else {
+      try {
+        await Bun.write(filePath, out);
+        log('✔', filePath);
+      } catch (e) {
+        console.error('[security-mw] write failed:', filePath, e.message);
+        failed++;
+      }
+    }
+  }
+
+  log(`\ntransform-security-middleware: processed=${processed}, failed=${failed}`);
+  if (failed) Bun.exit(1);
+}
+
+main().catch(e => {
+  console.error('[security-mw] fatal:', e);
+  Bun.exit(1);
+});

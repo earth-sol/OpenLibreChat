@@ -1,337 +1,273 @@
+#!/usr/bin/env bun
+
 /**
- * codemods/transform-db-utils.js
+ * scripts/transform-db-utils.js
  *
- * Bun-first, ESM jscodeshift transform for api/lib/db/**/*.js
+ * A Bun-native CLI codemod that converts Node‐fs sync calls in your
+ * api/lib/db utilities into Bun-native file APIs, for Bun-only runtimes.
  *
- * Usage (run under Bun):
- *   bunx jscodeshift \
- *     --extensions=js,ts \
- *     --parser=tsx \
- *     -t codemods/transform-db-utils.js \
- *     api/lib/db/**/*.{js,ts}
+ *  • Idempotent via "// bun: db-utils-updated" marker
+ *  • Uses jscodeshift.withParser('ts') for TS/JSX support
+ *  • Detects actual `fs` import/require alias
+ *  • Transforms:
+ *      - fs.readFileSync(path[, encoding])
+ *        → await Bun.file(path).text()
+ *      - fs.writeFileSync(path, data)
+ *        → await Bun.write(path, data)
+ *      - fs.existsSync(path)
+ *        → await Bun.file(path).exists()
+ *      - fs.unlinkSync(path)
+ *        → await Bun.file(path).delete()
+ *  • Marks parent functions async when injecting `await`
+ *  • Removes now-unused `fs`, `path`, `url` imports/requires
+ *  • Skips files already stamped
+ *  • Supports --dry-run/-d and --quiet/-q
+ *  • Configurable root via --root=<dir>
  */
-export default function transformer(fileInfo, api) {
-  const j = api.jscodeshift;
-  const root = j(fileInfo.source);
 
-  const debug = (...args) => console.debug('[transform-db-utils]', ...args);
+import { Glob } from 'bun'
+import jscodeshiftPkg from 'jscodeshift'
+import path from 'path'
 
-  debug(`⟳ ${fileInfo.path}`);
+const args     = Bun.argv.slice(1)
+const dryRun   = args.includes('--dry-run') || args.includes('-d')
+const quiet    = args.includes('--quiet')    || args.includes('-q')
+const rootFlag = args.find(a => a.startsWith('--root='))
+const baseDir  = rootFlag
+  ? path.resolve(rootFlag.split('=')[1])
+  : process.cwd()
 
-  // --- 1) Remove `fs` & `path` imports/requires ---
-  root
-    .find(j.ImportDeclaration, {
-      source: { value: val => val === 'fs' || val === 'path' }
-    })
+const log   = (...msg) => !quiet && console.log(...msg)
+const debug = (...msg) => !quiet && console.debug('[transform-db-utils]', ...msg)
+
+/** Find the local alias for `fs` (import or require) */
+function findFsAlias(root, j) {
+  let alias = null
+
+  // ES import: import fs from 'fs' or import * as fs from 'fs'
+  root.find(j.ImportDeclaration, { source: { value: 'fs' } })
     .forEach(p => {
-      debug('Removing import', p.value.source.value, 'line', p.value.loc.start.line);
-      j(p).remove();
-    });
-
-  root
-    .find(j.CallExpression, {
-      callee: { name: 'require' },
-      arguments: arg =>
-        arg[0] &&
-        (arg[0].value === 'fs' || arg[0].value === 'path')
-    })
-    .forEach(p => {
-      debug('Removing require', p.value.arguments[0].value, 'line', p.value.loc.start.line);
-      j(p.parent).remove(); // remove `const fs = require('fs')`
-    });
-
-  // --- Helpers for path → URL conversion ---
-  function isDirname(node) {
-    return node.type === 'Identifier' && node.name === '__dirname';
-  }
-  function isFilename(node) {
-    return node.type === 'Identifier' && node.name === '__filename';
-  }
-  function makeURLLiteral(pathLiteral) {
-    return j.newExpression(
-      j.identifier('URL'),
-      [
-        j.literal(pathLiteral),
-        j.memberExpression(
-          j.metaProperty(j.identifier('import'), j.identifier('meta')),
-          j.identifier('url')
-        )
-      ]
-    );
-  }
-  function replaceDirname(pathNode) {
-    debug('→ __dirname → URL(".", import.meta.url) at line', pathNode.value.loc.start.line);
-    j(pathNode).replaceWith(
-      makeURLLiteral('./')
-    );
-  }
-  function replaceFilename(pathNode) {
-    debug('→ __filename → import.meta.url at line', pathNode.value.loc.start.line);
-    j(pathNode).replaceWith(
-      j.memberExpression(
-        j.metaProperty(j.identifier('import'), j.identifier('meta')),
-        j.identifier('url')
-      )
-    );
-  }
-
-  // --- 2) Replace __dirname & __filename ---
-  root.find(j.Identifier, { name: '__dirname' }).forEach(replaceDirname);
-  root.find(j.Identifier, { name: '__filename' }).forEach(replaceFilename);
-
-  // --- 3) Handle path.join/resolve(__dirname, 'a', 'b') ---
-  root
-    .find(j.CallExpression, {
-      callee: {
-        object: { name: 'path' },
-        property: { name: name => name === 'join' || name === 'resolve' }
-      }
-    })
-    .forEach(p => {
-      const args = p.value.arguments;
-      if (
-        args.length >= 2 &&
-        isDirname(args[0]) &&
-        args.slice(1).every(a => a.type === 'Literal')
-      ) {
-        const segments = args.slice(1).map(a => a.value);
-        const joined = segments.join('/');
-        debug(
-          `→ path.${p.value.callee.property.name}(__, ${segments.join(
-            ','
-          )}) → URL("${joined}", import.meta.url) at line`,
-          p.value.loc.start.line
-        );
-        j(p).replaceWith(makeURLLiteral(joined));
-      }
-    });
-
-  // --- 4) FS → Bun API patterns ---
-  const fsPatterns = [
-    // sync & promise read
-    {
-      test: (o, p) =>
-        (o === 'fs' && p === 'readFileSync') ||
-        (o === 'fs' &&
-          p === 'promises' &&
-          // require two steps: .promises.readFile
-          false),
-      replace: pathNode => {
-        const { node } = pathNode;
-        const args = node.arguments;
-        const raw = args[0] || j.literal('');
-        const encoding = args[1] && args[1].type === 'Literal' ? args[1].value : null;
-        const method = /utf-?8/i.test(encoding) ? 'text' : 'arrayBuffer';
-        const fileExpr = transformArg(raw);
-        debug(`→ read → Bun.file().${method}() at line`, node.loc.start.line);
-        j(pathNode).replaceWith(
-          j.awaitExpression(
-            j.callExpression(
-              j.memberExpression(
-                j.callExpression(
-                  j.memberExpression(j.identifier('Bun'), j.identifier('file')),
-                  [fileExpr]
-                ),
-                j.identifier(method)
-              ),
-              []
-            )
-          )
-        );
-      }
-    },
-    // write
-    {
-      test: (o, p) =>
-        (o === 'fs' && p === 'writeFileSync') ||
-        (o === 'fs' &&
-          p === 'promises' &&
-          false),
-      replace: pathNode => {
-        const { node } = pathNode;
-        const [raw, data, opts] = node.arguments;
-        const fileExpr = transformArg(raw);
-        const dataExpr = data || j.literal('');
-        const args = opts ? [fileExpr, dataExpr, opts] : [fileExpr, dataExpr];
-        debug(`→ write → Bun.write() at line`, node.loc.start.line);
-        j(pathNode).replaceWith(
-          j.awaitExpression(
-            j.callExpression(
-              j.memberExpression(j.identifier('Bun'), j.identifier('write')),
-              args
-            )
-          )
-        );
-      }
-    },
-    // exists
-    {
-      test: (o, p) => o === 'fs' && p === 'existsSync',
-      replace: pathNode => {
-        const { node } = pathNode;
-        const raw = node.arguments[0] || j.literal('');
-        const fileExpr = transformArg(raw);
-        debug(`→ exists → Bun.file().exists() at line`, node.loc.start.line);
-        j(pathNode).replaceWith(
-          j.awaitExpression(
-            j.callExpression(
-              j.memberExpression(
-                j.callExpression(
-                  j.memberExpression(j.identifier('Bun'), j.identifier('file')),
-                  [fileExpr]
-                ),
-                j.identifier('exists')
-              ),
-              []
-            )
-          )
-        );
-      }
-    },
-    // unlink
-    {
-      test: (o, p) =>
-        (o === 'fs' && p === 'unlinkSync') ||
-        (o === 'fs' &&
-          p === 'promises' &&
-          false),
-      replace: pathNode => {
-        const { node } = pathNode;
-        const raw = node.arguments[0] || j.literal('');
-        const fileExpr = transformArg(raw);
-        debug(`→ unlink → Bun.remove() at line`, node.loc.start.line);
-        j(pathNode).replaceWith(
-          j.awaitExpression(
-            j.callExpression(
-              j.memberExpression(j.identifier('Bun'), j.identifier('remove')),
-              [fileExpr]
-            )
-          )
-        );
-      }
-    },
-    // mkdir
-    {
-      test: (o, p) =>
-        (o === 'fs' && p === 'mkdirSync') ||
-        (o === 'fs' &&
-          p === 'promises' &&
-          false),
-      replace: pathNode => {
-        const { node } = pathNode;
-        const [raw, opts] = node.arguments;
-        const fileExpr = transformArg(raw);
-        const args = opts ? [fileExpr, opts] : [fileExpr];
-        debug(`→ mkdir → Bun.mkdir() at line`, node.loc.start.line);
-        j(pathNode).replaceWith(
-          j.awaitExpression(
-            j.callExpression(
-              j.memberExpression(j.identifier('Bun'), j.identifier('mkdir')),
-              args
-            )
-          )
-        );
-      }
-    },
-    // readdir
-    {
-      test: (o, p) =>
-        (o === 'fs' && p === 'readdirSync') ||
-        (o === 'fs' &&
-          p === 'promises' &&
-          false),
-      replace: pathNode => {
-        const { node } = pathNode;
-        const raw = node.arguments[0] || j.literal('');
-        const fileExpr = transformArg(raw);
-        debug(`→ readdir → Bun.readdir() at line`, node.loc.start.line);
-        j(pathNode).replaceWith(
-          j.awaitExpression(
-            j.callExpression(
-              j.memberExpression(j.identifier('Bun'), j.identifier('readdir')),
-              [fileExpr]
-            )
-          )
-        );
-      }
-    }
-  ];
-
-  // helper: apply FS patterns
-  fsPatterns.forEach(({ test, replace }) => {
-    root
-      .find(j.CallExpression)
-      .filter(p => {
-        const { callee } = p.value;
-        if (callee.type === 'MemberExpression') {
-          // handle fs.readFileSync or fs.promises.readFile
-          if (
-            callee.object.type === 'MemberExpression' &&
-            callee.object.object.name === 'fs' &&
-            callee.object.property.name === 'promises' &&
-            callee.property.name &&
-            test('fs', 'promises', callee.property.name)
-          ) {
-            return true;
-          }
-          if (
-            callee.object.name === 'fs' &&
-            test('fs', callee.property.name)
-          ) {
-            return true;
-          }
-        }
-        return false;
+      p.node.specifiers.forEach(spec => {
+        alias = spec.local.name
       })
-      .forEach(replace);
-  });
+    })
 
-  // --- 5) Mark async functions that now use await ---
-  root
-    .find(j.Function)
-    .forEach(p => {
-      if (!p.value.async && j(p).find(j.AwaitExpression).size()) {
-        debug('Marking async function at line', p.value.loc.start.line);
-        p.value.async = true;
-      }
-    });
-  root
-    .find(j.ArrowFunctionExpression)
-    .forEach(p => {
-      if (!p.value.async && j(p).find(j.AwaitExpression).size()) {
-        debug('Marking async arrow at line', p.value.loc.start.line);
-        p.value.async = true;
-      }
-    });
+  if (alias) return alias
 
-  return root.toSource({ quote: 'single' });
-
-  // --- utility to handle __dirname + literals & path.join/resolve etc ---
-  function transformArg(node) {
-    // literal joins: __dirname + '/a/b'
-    if (
-      node.type === 'BinaryExpression' &&
-      node.operator === '+' &&
-      isDirname(node.left) &&
-      node.right.type === 'Literal'
-    ) {
-      const seg = String(node.right.value).replace(/^\/+/, '');
-      return makeURLLiteral(seg);
+  // CommonJS require: const fs = require('fs')
+  root.find(j.VariableDeclarator, {
+    init: {
+      callee: { name: 'require' },
+      arguments: [{ value: 'fs' }]
     }
-    // path.join/resolve
-    if (
-      node.type === 'CallExpression' &&
-      node.callee.type === 'MemberExpression' &&
-      node.callee.object.name === 'path' &&
-      (node.callee.property.name === 'join' ||
-        node.callee.property.name === 'resolve') &&
-      node.arguments.length >= 2 &&
-      isDirname(node.arguments[0]) &&
-      node.arguments.slice(1).every(a => a.type === 'Literal')
-    ) {
-      const segs = node.arguments.slice(1).map(a => a.value);
-      return makeURLLiteral(segs.join('/'));
+  }).forEach(p => {
+    if (p.node.id.type === 'Identifier') {
+      alias = p.node.id.name
     }
-    return node;
+  })
+
+  return alias || 'fs'
+}
+
+/** Mark the nearest enclosing function async if not already */
+function ensureAsync(path, j) {
+  const fn = path.closest(
+    p =>
+      p.node.type === 'FunctionDeclaration' ||
+      p.node.type === 'FunctionExpression' ||
+      p.node.type === 'ArrowFunctionExpression'
+  )
+  if (fn && !fn.node.async) {
+    fn.node.async = true
+    debug('marked function async at line', fn.node.loc.start.line)
   }
 }
+
+/** Remove ESM import of `mod` */
+function removeImport(root, j, mod) {
+  const imps = root.find(j.ImportDeclaration, { source: { value: mod } })
+  if (imps.size()) {
+    imps.remove()
+    debug(`removed import '${mod}'`)
+    return true
+  }
+  return false
+}
+
+/** Remove CommonJS require of `mod` */
+function removeRequire(root, j, mod) {
+  const calls = root.find(j.CallExpression, {
+    callee: { name: 'require' },
+    arguments: [{ value: mod }]
+  })
+  if (calls.size()) {
+    calls.forEach(p => j(p).parent.remove())
+    debug(`removed require('${mod}')`)
+    return true
+  }
+  return false
+}
+
+/** Perform AST transforms on a single file */
+function transform(source, filePath) {
+  if (source.includes('// bun: db-utils-updated')) {
+    debug('already updated:', filePath)
+    return null
+  }
+
+  const j    = jscodeshiftPkg.withParser('ts')
+  const root = j(source)
+  let did    = false
+
+  debug('processing', filePath)
+
+  // 1) Idempotency marker
+  root.get().node.program.body.unshift(
+    j.expressionStatement(j.literal('// bun: db-utils-updated'))
+  )
+  did = true
+
+  // 2) Detect fs alias and remove its import/require later
+  const fsAlias = findFsAlias(root, j)
+
+  // 3) Transform fs.*Sync calls
+  const mappings = [
+    {
+      name: 'readFileSync',
+      replace: args => {
+        const [pathArg] = args
+        return j.awaitExpression(
+          j.callExpression(
+            j.memberExpression(
+              j.callExpression(j.identifier('Bun.file'), [pathArg]),
+              j.identifier('text')
+            ),
+            []
+          )
+        )
+      }
+    },
+    {
+      name: 'writeFileSync',
+      replace: args => {
+        const [pathArg, dataArg] = args
+        return j.awaitExpression(
+          j.callExpression(j.identifier('Bun.write'), [pathArg, dataArg])
+        )
+      }
+    },
+    {
+      name: 'existsSync',
+      replace: args => {
+        const [pathArg] = args
+        return j.awaitExpression(
+          j.callExpression(
+            j.memberExpression(
+              j.callExpression(j.identifier('Bun.file'), [pathArg]),
+              j.identifier('exists')
+            ),
+            []
+          )
+        )
+      }
+    },
+    {
+      name: 'unlinkSync',
+      replace: args => {
+        const [pathArg] = args
+        return j.awaitExpression(
+          j.callExpression(
+            j.memberExpression(
+              j.callExpression(j.identifier('Bun.file'), [pathArg]),
+              j.identifier('delete')
+            ),
+            []
+          )
+        )
+      }
+    }
+  ]
+
+  mappings.forEach(({ name, replace }) => {
+    root.find(j.CallExpression, {
+      callee: {
+        type: 'MemberExpression',
+        object: { name: fsAlias },
+        property: { name }
+      }
+    }).forEach(path => {
+      const newExpr = replace(path.node.arguments)
+      path.replace(newExpr)
+      ensureAsync(path, j)
+      did = true
+      debug(`replaced fs.${name} at line`, path.node.loc.start.line)
+    })
+  })
+
+  // 4) Remove now-unused fs/path/url imports & requires
+  ['fs', 'path', 'url'].forEach(mod => {
+    removeImport(root, j, mod) || removeRequire(root, j, mod)
+  })
+
+  return did
+    ? root.toSource({ quote: 'single', trailingComma: true })
+    : null
+}
+
+/** Main runner */
+async function main() {
+  const pattern = path.join(baseDir, 'api/lib/db/**/*.{js,ts}')
+  let processed = 0
+  let failed    = 0
+
+  for await (const filePath of new Glob([pattern])) {
+    if (
+      filePath.includes('node_modules') ||
+      filePath.endsWith('transform-db-utils.js')
+    ) continue
+
+    let src
+    try {
+      src = await Bun.file(filePath).text()
+    } catch (e) {
+      console.error('[transform-db-utils] read failed:', filePath, e.message)
+      failed++
+      continue
+    }
+
+    let out
+    try {
+      out = transform(src, filePath)
+    } catch (e) {
+      console.error('[transform-db-utils] transform error in', filePath, e)
+      failed++
+      continue
+    }
+
+    processed++
+    if (!out) {
+      debug('no changes:', filePath)
+      continue
+    }
+
+    if (dryRun) {
+      log('DRY', filePath)
+    } else {
+      try {
+        await Bun.write(filePath, out)
+        log('✔', filePath)
+      } catch (e) {
+        console.error('[transform-db-utils] write failed:', filePath, e.message)
+        failed++
+      }
+    }
+  }
+
+  log(`\ntransform-db-utils: processed=${processed}, failed=${failed}`)
+  if (failed) Bun.exit(1)
+}
+
+main().catch(e => {
+  console.error('[transform-db-utils] fatal:', e)
+  Bun.exit(1)
+})

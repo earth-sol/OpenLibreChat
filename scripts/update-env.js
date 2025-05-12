@@ -1,205 +1,124 @@
 #!/usr/bin/env bun
-/**
- * scripts/update-env.js
- * --------------------------------
- * Bun-native CLI to update .env files based on Bun.env values.
- * - Supports multiple input .env files.
- * - Auto-detects `.env*` if none provided.
- * - Strict mode (fail on missing env), dry-run, JSON output, fallback defaults.
- * - Safe atomic writes.
- * - Uses only Bun Core APIs (Bun.file, Bun.write, Bun.Glob, Bun.spawnSync).
- * - Pure JavaScript + JSDoc.
- */
 
 /**
- * @param {string} msg
+ * Recursively finds all ".env*" files under the project root (except node_modules/.env)
+ * and updates any KEY=… lines where the KEY exists in Bun.env.
+ *
+ * ✔ Uses Bun.Glob for native file matching
+ * ✔ Reads & writes files via Bun.file() / Bun.write()
+ * ✔ Verbose-by-default logging (pass --quiet or --silent to suppress)
+ * ✔ Supports --dry-run to preview without writing
+ * ✔ Idempotent: re-running won’t reapply unchanged values
+ * ✔ Graceful per-file error handling, exit code >0 if any failures
  */
-function print(msg) {
-  console.log(`ℹ️  ${msg}`);
-}
 
-/**
- * @param {string} msg
- */
-function success(msg) {
-  console.log(`✅ ${msg}`);
-}
-
-/**
- * @param {string} msg
- */
-function warn(msg) {
-  console.warn(`⚠️  ${msg}`);
-}
-
-/**
- * @param {string} msg
- */
-function error(msg) {
-  console.error(`❌ ${msg}`);
-  Bun.exit(1);
-}
-
-/**
- * Checks if an executable exists in PATH.
- * @param {string} name
- * @returns {boolean}
- */
-function checkExecutable(name) {
-  const r = Bun.spawnSync(["which", name], { stdout: "ignore", stderr: "ignore" });
-  return r.exitCode === 0;
-}
-
-/**
- * Parses CLI arguments.
- * @param {string[]} args
- * @returns {{ options: Record<string,string>, positional: string[] }}
- */
-function parseArgs(args) {
-  const options = {};
-  const positional = [];
-  for (const arg of args) {
-    if (arg === "--strict") {
-      options.strict = "true";
-    } else if (arg === "--dry-run") {
-      options.dryRun = "true";
-    } else if (arg === "--json") {
-      options.json = "true";
-    } else if (arg.startsWith("--fallback=")) {
-      options.fallback = arg.split("=")[1] ?? "";
-    } else {
-      positional.push(arg);
-    }
-  }
-  return { options, positional };
-}
-
-/**
- * Finds all `.env*` files in the project root.
- * @returns {Promise<string[]>}
- */
-async function findEnvFiles() {
-  const glob = new Bun.Glob(".env*");
-  const matches = await glob.scan({ cwd: Bun.env.PWD || ".", absolute: true });
-  return matches;
-}
-
-/**
- * Reads an env file and returns its lines.
- * @param {string} path
- * @returns {Promise<string[]>}
- */
-async function readEnvFile(path) {
-  return (await Bun.file(path).text()).split(/\r?\n/);
-}
-
-/**
- * Writes lines to a file atomically.
- * @param {string} outPath
- * @param {string[]} lines
- */
-async function writeEnvFile(outPath, lines) {
-  const tmpdir = Bun.env.TMPDIR || "/tmp";
-  const tmpPath = `${tmpdir}/update-env-${Date.now()}.tmp`;
-  await Bun.write(tmpPath, lines.join("\n"));
-  await Bun.write(outPath, await Bun.file(tmpPath).text());
-}
-
-/**
- * Main entrypoint.
- */
 async function main() {
-  // Ensure Bun present
-  if (!checkExecutable("bun")) {
-    error("Bun is not installed. Install from https://bun.sh/");
-  }
-  const bunVer = Bun.spawnSync(["bun", "--version"], { stdout: "pipe" })
-    .stdout.toString().trim();
-  print(`Bun version: ${bunVer}`);
+  // ─── CLI FLAGS ──────────────────────────────────────────────────────────────
+  const args   = Bun.argv.slice(1);
+  const dryRun = args.includes("--dry")    || args.includes("--dry-run");
+  const quiet  = args.includes("--quiet")  || args.includes("--silent");
+  const help   = args.includes("-h")       || args.includes("--help");
 
-  const { options, positional } = parseArgs(Bun.argv.slice(2));
-  const outputPath = positional[0];
-  let inputPaths = positional.slice(1);
+  if (help) {
+    console.log(`
+Usage: update-envs.js [options]
 
-  if (!outputPath) {
-    error("Usage: bun scripts/update-env.js <output.env> [input.env ...] [--strict] [--dry-run] [--json] [--fallback=value]");
-  }
-
-  if (inputPaths.length === 0) {
-    print("No input files provided; auto-detecting .env* files...");
-    inputPaths = await findEnvFiles();
-    if (inputPaths.length === 0) {
-      error("No .env* files found for input.");
-    }
-    print(`Detected ${inputPaths.length} env files: ${inputPaths.join(", ")}`);
+Options:
+  --dry-run, --dry      Preview without writing any files
+  --quiet, --silent     Suppress all output
+  -h, --help            Show this help
+`);
+    Bun.exit(0);
   }
 
-  const strict = options.strict === "true";
-  const dryRun = options.dryRun === "true";
-  const jsonOut = options.json === "true";
-  const fallbackDefault = options.fallback ?? "";
+  const log   = (...m) => { if (!quiet) console.log(...m) };
+  const error = (...m) => console.error(...m);
+  const debug = (...m) => { if (!quiet) console.debug(...m) };
 
-  // Read and merge all lines
-  const merged = [];
-  for (const path of inputPaths) {
-    if (!(await Bun.file(path).exists())) {
-      warn(`Skipping missing input file: ${path}`);
+  log("▶ update-envs: starting");
+
+  // ─── PROJECT ROOT ────────────────────────────────────────────────────────────
+  const rootUrl  = new URL("../", import.meta.url);
+  const rootPath = Bun.fileURLToPath(rootUrl);
+
+  // ─── FIND .env* FILES ────────────────────────────────────────────────────────
+  const glob = new Bun.Glob(".env*");
+  let processed = 0, updated = 0, skipped = 0, errors = 0;
+
+  for await (const relPath of glob.scan({ cwd: rootPath, absolute: false, onlyFiles: true })) {
+    // Skip .env.example or files in node_modules
+    if (relPath.startsWith("node_modules/") || relPath.endsWith(".example")) {
+      debug(`↪ skipping ${relPath}`);
       continue;
     }
-    merged.push(...await readEnvFile(path));
-  }
 
-  const updatedLines = [];
-  const updates = [];
-  const missing = [];
+    const filePath = rootPath + "/" + relPath;
+    processed++;
+    debug(`\n[+] Processing ${relPath}`);
 
-  for (const line of merged) {
-    const m = line.match(/^\s*([A-Z0-9_]+)=GET_FROM_LOCAL_ENV\s*$/);
-    if (m) {
-      const key = m[1];
-      const val = Bun.env[key];
-      if (val !== undefined) {
-        updatedLines.push(`${key}=${val}`);
-        updates.push({ key, from: "GET_FROM_LOCAL_ENV", to: val });
-      } else if (fallbackDefault) {
-        updatedLines.push(`${key}=${fallbackDefault}`);
-        updates.push({ key, from: "GET_FROM_LOCAL_ENV", to: fallbackDefault });
-      } else {
-        missing.push(key);
-        updatedLines.push(line);
+    let text;
+    try {
+      text = await Bun.file(filePath).text();
+    } catch (err) {
+      error(`❌ Read failed: ${relPath}`, err.message);
+      errors++;
+      continue;
+    }
+
+    const lines = text.split(/\r?\n/);
+    let changed = false;
+
+    const outLines = lines.map((line) => {
+      // Match KEY=VALUE (no leading spaces)
+      const m = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+      if (!m) return line;
+
+      const [ , key, oldVal ] = m;
+      const newVal = Bun.env[key];
+      if (newVal === undefined) {
+        debug(`   ↪ no Bun.env[${key}], leaving unchanged`);
+        return line;
       }
+
+      // If value is already up-to-date, skip
+      if (oldVal === newVal) {
+        debug(`   ↪ ${key} already up-to-date`);
+        return line;
+      }
+
+      changed = true;
+      log(`   ✓ ${key}: "${oldVal}" → "${newVal}"`);
+      return `${key}=${newVal}`;
+    });
+
+    if (!changed) {
+      debug(`   ↪ no keys updated in ${relPath}`);
+      skipped++;
+      continue;
+    }
+
+    const newText = outLines.join("\n");
+    if (dryRun) {
+      log(`   (dry-run) would write updates to ${relPath}`);
+      updated++;
     } else {
-      updatedLines.push(line);
+      try {
+        await Bun.write(filePath, newText);
+        log(`   ✔ updated ${relPath}`);
+        updated++;
+      } catch (err) {
+        error(`❌ Write failed: ${relPath}`, err.message);
+        errors++;
+      }
     }
   }
 
-  if (missing.length && strict) {
-    missing.forEach(k => warn(`Missing Bun.env[${k}] and strict mode ON.`));
-    error("Aborting due to missing environment variables.");
-  } else if (missing.length) {
-    missing.forEach(k => warn(`Missing Bun.env[${k}], left unchanged.`));
-  }
-
-  if (dryRun) {
-    if (jsonOut) {
-      console.log(JSON.stringify(updates, null, 2));
-    } else {
-      console.log(updatedLines.join("\n"));
-    }
-    return;
-  }
-
-  // Write final output atomically
-  await writeEnvFile(outputPath, updatedLines);
-
-  if (jsonOut) {
-    console.log(JSON.stringify(updates, null, 2));
-  } else {
-    if (updates.length) {
-      success(`Updated variables: ${updates.map(u => u.key).join(", ")}`);
-    }
-    success(`Wrote updated env to: ${outputPath}`);
-  }
+  // ─── SUMMARY & EXIT ──────────────────────────────────────────────────────────
+  log(`\n✔ update-envs: done. processed=${processed}, updated=${updated}, skipped=${skipped}, errors=${errors}`);
+  if (errors > 0) Bun.exit(1);
 }
 
-main().catch(e => error(e.message || String(e)));
+main().catch((err) => {
+  console.error("‼ update-envs crashed:", err);
+  Bun.exit(1);
+});

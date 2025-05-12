@@ -1,165 +1,106 @@
 #!/usr/bin/env bun
-/**
- * scripts/bun-install-all.js
- * --------------------------------
- * Bun-native CLI to install all dependencies across a monorepo.
- * - Auto-discovers all package.json (excluding build/test dirs)
- * - Installs in root first, then sub-packages
- * - Supports --verbose/-v, --concurrency=N, --dry-run
- * - Uses Bun Core APIs: Glob, spawn, env, exit
- * - Idempotent, fails gracefully, with debug logging
- */
-
-import { Glob } from "bun";
 
 /**
- * @param {string} msg
+ * Recursively runs `bun install` in the root and every subdirectory
+ * containing a package.json (excluding node_modules and .git).
+ * 
+ * ✔ Uses Bun.Glob for native, zero-install globs
+ * ✔ Uses Bun.spawn for native child processes
+ * ✔ Verbose by default (use --quiet or --silent to suppress)
+ * ✔ Supports --dry-run to preview without executing
+ * ✔ Graceful per-directory error handling, non-zero exit if any fail
  */
-function print(msg) {
-  console.log(`ℹ️  ${msg}`);
-}
-
-/**
- * @param {string} msg
- */
-function success(msg) {
-  console.log(`✅ ${msg}`);
-}
-
-/**
- * @param {string} msg
- */
-function error(msg) {
-  console.error(`❌ ${msg}`);
-  Bun.exit(1);
-}
-
-/**
- * @param {string} msg
- * @param {...any} args
- */
-function debugLog(msg, ...args) {
-  if (debug) console.debug(`🛠 [bun-install-all][debug] ${msg}`, ...args);
-}
-
-/**
- * Check if an executable exists in PATH.
- * @param {string} name
- * @returns {boolean}
- */
-function checkExecutable(name) {
-  return Bun.spawnSync(["which", name], { stdout: "ignore", stderr: "ignore" }).exitCode === 0;
-}
-
-/**
- * Parse CLI args for --verbose, --concurrency=N, --dry-run
- * @param {string[]} argv
- */
-function parseArgs(argv) {
-  const options = {};
-  for (const arg of argv) {
-    if (arg === "--verbose" || arg === "-v") {
-      options.verbose = true;
-    } else if (arg.startsWith("--concurrency=")) {
-      options.concurrency = parseInt(arg.split("=")[1], 10);
-    } else if (arg === "--dry-run") {
-      options.dryRun = true;
-    }
-  }
-  return options;
-}
-
-/**
- * Run async tasks with a concurrency limit.
- * @param {Array<() => Promise<void>>} tasks
- * @param {number} limit
- */
-async function runConcurrent(tasks, limit) {
-  let idx = 0;
-  async function worker() {
-    while (idx < tasks.length) {
-      const task = tasks[idx++];
-      await task();
-    }
-  }
-  await Promise.all(Array.from({ length: limit }, worker));
-}
-
-const options = parseArgs(Bun.argv.slice(2));
-const verbose = options.verbose === true;
-const dryRun = options.dryRun === true;
-const concurrency = Number.isInteger(options.concurrency) && options.concurrency > 0
-  ? options.concurrency
-  : 1;
-const debug = Boolean(Bun.env.DEBUG_LOGGING || Bun.env.DEBUG_CONSOLE);
 
 async function main() {
-  if (!checkExecutable("bun")) {
-    error("Bun CLI not found. Please install Bun from https://bun.sh/");
+  // ─── CLI FLAGS ──────────────────────────────────────────────────────────────
+  const args   = Bun.argv.slice(1);
+  const dryRun = args.includes("--dry")       || args.includes("--dry-run");
+  const quiet  = args.includes("--quiet")     || args.includes("--silent");
+  const help   = args.includes("-h")          || args.includes("--help");
+
+  if (help) {
+    console.log(`
+Usage: bun-install-all.js [options]
+
+Options:
+  --dry-run, --dry      Preview without actually running installs
+  --quiet, --silent     Suppress all output
+  -h, --help            Show this help
+`);
+    Bun.exit(0);
   }
 
-  // Determine working directory
-  const root = Bun.env.PWD;
-  debugLog("Working directory:", root);
+  const log   = (...m) => { if (!quiet) console.log(...m) };
+  const error = (...m) => console.error(...m);
+  const debug = (...m) => { if (!quiet) console.debug(...m) };
 
-  // Discover package.json files
-  const pkgFiles = [];
-  for await (const path of new Glob("**/package.json").scan(root)) {
-    if (/(node_modules|dist|build|\.git|coverage)\//.test(path)) {
-      debugLog("Skipping excluded path:", path);
+  log("▶ bun-install-all: starting");
+
+  // ─── PROJECT ROOT ────────────────────────────────────────────────────────────
+  // Script lives in scripts/, so project root is one directory up
+  const rootUrl  = new URL("../", import.meta.url);
+  const rootPath = Bun.fileURLToPath(rootUrl);
+
+  // ─── COLLECT DIRECTORIES ──────────────────────────────────────────────────────
+  // Always install in root
+  const dirs = new Set([rootPath]);
+
+  // Find all package.json files
+  const glob = new Bun.Glob("**/package.json");
+  for await (const pkgPath of glob.scan({ cwd: rootPath, absolute: true, onlyFiles: true })) {
+    // Skip vendor and git metadata
+    if (pkgPath.includes("/node_modules/") || pkgPath.includes("/.git/")) continue;
+    // Directory is everything before the last slash
+    const idx = pkgPath.lastIndexOf("/");
+    const dir = idx >= 0 ? pkgPath.slice(0, idx) : pkgPath;
+    dirs.add(dir);
+  }
+
+  // ─── RUN INSTALLS ────────────────────────────────────────────────────────────
+  let total = 0, failed = 0;
+  for (const dir of dirs) {
+    total++;
+    log(`→ [${total}/${dirs.size}] bun install in ${dir}`);
+    if (dryRun) {
+      log("   (dry-run) would run: bun install");
       continue;
     }
-    pkgFiles.push(path);
-  }
 
-  if (pkgFiles.length === 0) {
-    print("🔍 No package.json files found.");
-    return;
-  }
+    try {
+      // Spawn bun install in that directory
+      const proc = Bun.spawn({
+        cmd: ["bun", "install"],
+        cwd: dir,
+        stdout: "pipe",
+        stderr: "pipe"
+      });
 
-  // Sort: root first, then alphabetical
-  pkgFiles.sort((a, b) => {
-    if (a === `${root}/package.json`) return -1;
-    if (b === `${root}/package.json`) return 1;
-    return a.localeCompare(b);
-  });
+      const { exitCode } = await proc.exited;
+      const out = await proc.stdout.text();
+      const err = await proc.stderr.text();
 
-  print(`📦 Installing in ${pkgFiles.length} packages:`);
-  pkgFiles.forEach(p => print(`   • ${p.replace(root + "/", "")}`));
-
-  let hadError = false;
-  const tasks = pkgFiles.map(pkgPath => async () => {
-    const dir = pkgPath.replace(/\/package\.json$/, "");
-    print(`➡️  Installing in: ${dir}`);
-    debugLog("Install flags:", { dryRun, concurrency });
-    if (dryRun) {
-      debugLog("Dry-run mode: no actual install.");
-      return;
+      if (exitCode !== 0) {
+        error(`❌ install failed in ${dir} (exit ${exitCode})`);
+        if (out.trim()) error(out.trim());
+        if (err.trim()) error(err.trim());
+        failed++;
+      } else {
+        log("   ✔ success");
+        if (out.trim())  debug(out.trim());
+        if (err.trim())  debug(err.trim());
+      }
+    } catch (err) {
+      error(`❌ spawn error in ${dir}:`, err);
+      failed++;
     }
-    const proc = Bun.spawn(["bun", "install"], {
-      cwd: dir,
-      stdout: "inherit",
-      stderr: "inherit"
-    });
-    const exitCode = await proc.exited;
-    if (exitCode !== 0) {
-      console.error(`❌ Failed in ${dir} (exit code ${exitCode})`);
-      hadError = true;
-    } else {
-      success(`Installed successfully in ${dir}`);
-    }
-  });
-
-  await runConcurrent(tasks, concurrency);
-
-  if (hadError) {
-    error("⚠️ One or more installs failed.");
-  } else {
-    success("🎉 All installs completed successfully.");
   }
+
+  // ─── SUMMARY & EXIT ──────────────────────────────────────────────────────────
+  log(`\n✔ bun-install-all: done. total=${total}, failed=${failed}`);
+  if (failed > 0) Bun.exit(1);
 }
 
 main().catch(err => {
-  console.error("🚨 Unexpected error:", err);
+  console.error("‼ bun-install-all crashed:", err);
   Bun.exit(1);
 });
