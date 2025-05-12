@@ -1,108 +1,139 @@
 #!/usr/bin/env bun
 
 /**
- * codemods/transform-tsconfig.js
+ * transform-tsconfig.js
  *
- * Standalone Bun script (no Node APIs) to:
- *  • Scan for \\*\\*\/tsconfig\\*.json
- *  • Read each file via Bun.file().text()
- *  • Parse & apply:
- *      – TS flags: ESNext, react-jsx, bundler, noEmit, etc.
- *      – Migrate compilerOptions.paths → top-level imports
- *      – Inject default Elysia/Bun imports ("elysia", "@elysia/\\*", "bun:\\*")
- *      – Ensure ambient types ["elysia","bun"]
- *  • Overwrite each file via Bun.writeFile
- *  • Verbose console logging throughout
+ * - Ensures compilerOptions are configured for Bun & Elysia:
+ *   module: "ESNext", target: "ESNext", moduleDetection: "force",
+ *   jsx: "react-jsx", moduleResolution: "bundler",
+ *   allowImportingTsExtensions: true, verbatimModuleSyntax: true,
+ *   noEmit: true, importsNotUsedAsValues: "preserve"
+ * - Migrates any compilerOptions.paths → top-level imports (import map)
+ * - Uses Bun.Glob for native file discovery
+ * - Uses Bun.file().text() and Bun.write() for I/O
+ * - Verbose by default; suppress with --quiet or --silent
+ * - Supports --dry-run to preview without writing
+ * - Idempotent and fails gracefully per-file
  */
 
-const TS_FLAGS = {
-  module:                     'ESNext',
-  target:                     'ESNext',
-  moduleDetection:            'force',
-  jsx:                        'react-jsx',
-  moduleResolution:           'bundler',
-  allowImportingTsExtensions: true,
-  verbatimModuleSyntax:       true,
-  noEmit:                     true,
-  importsNotUsedAsValues:     'preserve'
-};
-
-const DEFAULT_IMPORTS = {
-  "elysia":      ["elysia"],
-  "@elysia/*":   ["@elysia/*"],
-  "bun:*":       ["bun:*"]
-};
-
-const DEFAULT_TYPES = ['elysia', 'bun'];
-
-function transformConfig(src, filePath) {
-  let cfg;
-  try {
-    cfg = JSON.parse(src);
-  } catch {
-    console.warn(`[transform-tsconfig] ⚠ Invalid JSON in ${filePath}, skipping.`);
-    return null;
-  }
-
-  console.log(`[transform-tsconfig] • Applying TS_FLAGS to ${filePath}`);
-  const opts = cfg.compilerOptions ||= {};
-  Object.assign(opts, TS_FLAGS);
-
-  if (opts.paths && typeof opts.paths === 'object') {
-    const aliases = Object.keys(opts.paths);
-    cfg.imports ||= {};
-    for (const [alias, targets] of Object.entries(opts.paths)) {
-      cfg.imports[alias] = targets;
-    }
-    delete opts.paths;
-    console.log(
-      `[transform-tsconfig]   ↳ Migrated paths → imports: ${aliases.join(', ')}`
-    );
-  } else {
-    console.log(`[transform-tsconfig]   ↳ No paths to migrate`);
-  }
-
-  cfg.imports ||= {};
-  const injected = [];
-  for (const [k, v] of Object.entries(DEFAULT_IMPORTS)) {
-    if (cfg.imports[k] == null) {
-      cfg.imports[k] = v;
-      injected.push(k);
-    }
-  }
-  console.log(
-    injected.length
-      ? `[transform-tsconfig]   ↳ Injected default imports: ${injected.join(', ')}`
-      : `[transform-tsconfig]   ↳ Default imports already present`
-  );
-
-  const typesSet = new Set(opts.types || []);
-  DEFAULT_TYPES.forEach((t) => typesSet.add(t));
-  opts.types = Array.from(typesSet);
-  console.log(
-    `[transform-tsconfig]   ↳ Ensured ambient types: ${opts.types.join(', ')}`
-  );
-
-  return JSON.stringify(cfg, null, 2) + '\n';
-}
-
 async function main() {
-  console.log(`[transform-tsconfig] Starting scan…`);
-  for await (const entry of Bun.scandir('.', { recursive: true, includeDirs: false })) {
-    if (!entry.isFile || !/^tsconfig.*\.json$/.test(entry.name)) continue;
-    const filePath = entry.path;
-    console.log(`\n[transform-tsconfig] === Processing ${filePath} ===`);
-    const src = await Bun.file(filePath).text();
-    const out = transformConfig(src, filePath);
-    if (out !== null) {
-      await Bun.writeFile(filePath, out);
-      console.log(`[transform-tsconfig] ✔ Wrote updated ${filePath}`);
+  // CLI flags
+  const args   = Bun.argv.slice(1);
+  const dryRun = args.includes("--dry")    || args.includes("--dry-run");
+  const quiet  = args.includes("--quiet")  || args.includes("--silent");
+  const help   = args.includes("-h")       || args.includes("--help");
+  if (help) {
+    console.log(`
+Usage: transform-tsconfig.js [options]
+
+Options:
+  --dry-run, --dry      Preview changes without writing files
+  --quiet, --silent     Suppress all output
+  -h, --help            Show this help
+`);
+    Bun.exit(0);
+  }
+
+  const log   = (...m) => { if (!quiet) console.log(...m) };
+  const error = (...m) => console.error(...m);
+
+  log("▶ transform-tsconfig: starting");
+
+  // Discover all tsconfig*.json files under the repo
+  const glob = new Bun.Glob("**/tsconfig*.json");
+  let processed = 0, failed = 0;
+
+  for await (const relPath of glob.scan({ cwd: ".", absolute: false, onlyFiles: true })) {
+    // Skip node_modules
+    if (relPath.includes("node_modules/")) continue;
+
+    processed++;
+    log(`\n→ ${relPath}`);
+
+    // Read
+    let text;
+    try {
+      text = await Bun.file(relPath).text();
+    } catch (err) {
+      error(`  ❌ failed to read: ${err.message}`);
+      failed++;
+      continue;
+    }
+
+    // Parse JSON
+    let cfg;
+    try {
+      cfg = JSON.parse(text);
+    } catch (err) {
+      error(`  ❌ JSON parse error: ${err.message}`);
+      failed++;
+      continue;
+    }
+
+    // Prepare flags
+    const co = cfg.compilerOptions = cfg.compilerOptions || {};
+    let changed = false;
+
+    // Ensure compilerOptions
+    const ensure = (key, value) => {
+      if (co[key] !== value) {
+        co[key] = value;
+        log(`   ✓ set compilerOptions.${key} = ${JSON.stringify(value)}`);
+        changed = true;
+      }
+    };
+
+    ensure("module", "ESNext");
+    ensure("target", "ESNext");
+    ensure("moduleDetection", "force");
+    ensure("jsx", "react-jsx");
+    ensure("moduleResolution", "bundler");
+    ensure("allowImportingTsExtensions", true);
+    ensure("verbatimModuleSyntax", true);
+    ensure("noEmit", true);
+    ensure("importsNotUsedAsValues", "preserve");
+
+    // Migrate paths → imports (import map)
+    if (co.paths) {
+      cfg.imports = cfg.imports || {};
+      for (const [alias, targets] of Object.entries(co.paths)) {
+        // Only string-array values
+        if (Array.isArray(targets)) {
+          cfg.imports[alias] = targets;
+          log(`   ✓ migrated paths['${alias}'] → imports['${alias}']`);
+        }
+      }
+      delete co.paths;
+      changed = true;
+    }
+
+    // Idempotent: no-op if nothing changed
+    if (!changed) {
+      log("   ↪ no changes needed");
+      continue;
+    }
+
+    // Stringify with 2-space indent
+    const out = JSON.stringify(cfg, null, 2) + "\n";
+
+    if (dryRun) {
+      log("   (dry-run) would write changes");
+    } else {
+      try {
+        await Bun.write(relPath, out);
+        log("   ✔ written");
+      } catch (err) {
+        error(`  ❌ write failed: ${err.message}`);
+        failed++;
+      }
     }
   }
-  console.log(`\n[transform-tsconfig] All done!`);
+
+  log(`\n✔ transform-tsconfig: processed=${processed}, failed=${failed}`);
+  if (failed) Bun.exit(1);
 }
 
-main().catch((err) => {
-  console.error(`[transform-tsconfig] Fatal error:`, err);
-  process.exit(1);
+main().catch(err => {
+  console.error("‼ transform-tsconfig crashed:", err);
+  Bun.exit(1);
 });

@@ -1,149 +1,230 @@
 #!/usr/bin/env bun
+
 /**
- * codemods/transform-jest-config.js
+ * transform-jest-config.js
  *
- * - Scans for all `api/jest.config.js` and `packages/\\*\\*\/jest.config.\\*` files
- * - Uses Bun’s native I/O (Bun.scandir, Bun.file, Bun.write) exclusively
- * - Applies a jscodeshift transformer to:
- *    • Remove `testEnvironment`, `transform`, and any existing `testMatch`
- *    • Inject a Bun‐friendly `testMatch` array
- *    • Preserve `setupFiles` and mocks
- *    • Anchor all `moduleNameMapper` keys (`^…$`)
- * - Emits verbose debug logs at every step (always on)
+ * - Converts existing Jest configs (CJS or ESM) to Bun-friendly patterns:
+ *   - Removes `testEnvironment` and `transform`
+ *   - Ensures `testMatch` matches your Bun patterns
+ *   - Anchors all `moduleNameMapper` keys with ^…$
+ * - Scans `api/jest.config.js` and `packages/\*\*\/jest.config.\*`
+ * - Uses Bun.Glob for native file globs
+ * - Uses Babel for AST transforms
+ * - Bun-native I/O (`Bun.file`, `Bun.write`)
+ * - Verbose by default; `--quiet` to silence
+ * - Supports `--dry-run` to preview without writing
+ * - Idempotent and graceful on errors
  */
 
-import jscodeshift from 'jscodeshift';
+import { Glob } from "bun";
+import path from "path";
+import { parse } from "@babel/parser";
+import traverse from "@babel/traverse";
+import generate from "@babel/generator";
+import * as t from "@babel/types";
 
-function transformer(fileInfo, { jscodeshift: j }) {
-  console.debug(`[transform-jest-config] ▶ Transforming ${fileInfo.path}`);
+async function main() {
+  const args   = Bun.argv.slice(1);
+  const dryRun = args.includes("--dry")    || args.includes("--dry-run");
+  const quiet  = args.includes("--quiet")  || args.includes("--silent");
+  const help   = args.includes("-h")       || args.includes("--help");
 
-  const root = j(fileInfo.source);
+  if (help) {
+    console.log(`
+Usage: transform-jest-config.js [options]
 
-  // Bun-friendly test globs
-  const testPatterns = [
-    '<rootDir>/api/test/**/*.{spec,test}.js',
-    '<rootDir>/client/test/**/*.{spec,test}.tsx',
-    '<rootDir>/packages/**/test/**/*.{spec,test}.{js,ts,tsx}',
-    '<rootDir>/e2e/specs/**/*.{spec,test}.{js,ts}'
+Options:
+  --dry-run, --dry      Preview changes without writing files
+  --quiet, --silent     Suppress all output
+  -h, --help            Show this help
+`);
+    Bun.exit(0);
+  }
+
+  const log   = (...m) => { if (!quiet) console.log(...m) };
+  const error = (...m) => console.error(...m);
+
+  log("▶ transform-jest-config: starting");
+
+  // Code root (LibreChat-main) is two levels up from this codemod
+  const codeRootUrl  = new URL("../../LibreChat-main", import.meta.url);
+  const rootPath     = Bun.fileURLToPath(codeRootUrl);
+
+  // Patterns to match Jest config files
+  const patterns = [
+    "api/jest.config.js",
+    "packages/**/jest.config.*"
   ];
 
-  function processConfig(objExpr) {
-    console.debug(
-      '[transform-jest-config] • original keys:',
-      objExpr.properties.map(p => p.key.name || p.key.value)
-    );
+  const files = new Set();
+  for (const pat of patterns) {
+    const glob = new Glob(pat);
+    for await (const rel of glob.scan({ cwd: rootPath, absolute: false, onlyFiles: true })) {
+      files.add(rel);
+    }
+  }
 
-    // Strip unwanted props
-    objExpr.properties = objExpr.properties.filter(prop => {
-      const key =
-        prop.key.type === 'Identifier' ? prop.key.name : prop.key.value;
-      return !['testEnvironment', 'transform', 'testMatch'].includes(key);
-    });
+  if (files.size === 0) {
+    log("⚠ No Jest config files found");
+    return;
+  }
 
-    console.debug(
-      '[transform-jest-config] • pruned keys:',
-      objExpr.properties.map(p => p.key.name || p.key.value)
-    );
+  const testMatchPatterns = [
+    "api/test/**/*.{spec,test}.js",
+    "client/test/**/*.{spec,test}.tsx",
+    "packages/**/test/**/*.{spec,test}.{js,ts,tsx}",
+    "e2e/specs/**/*.{spec,test}.{js,ts}"
+  ].map(p => t.stringLiteral(p));
 
-    // Inject testMatch
-    objExpr.properties.push(
-      j.property(
-        'init',
-        j.identifier('testMatch'),
-        j.arrayExpression(testPatterns.map(pat => j.literal(pat)))
-      )
-    );
+  let processed = 0, failed = 0;
+  for (const relFile of files) {
+    processed++;
+    const absFile = path.join(rootPath, relFile);
+    log(`\n→ ${relFile}`);
 
-    console.debug(
-      '[transform-jest-config] • injected testMatch:',
-      testPatterns
-    );
+    let src;
+    try {
+      src = await Bun.file(absFile).text();
+    } catch (err) {
+      error("  ❌ read failed:", err.message);
+      failed++;
+      continue;
+    }
 
-    // Anchor moduleNameMapper keys
-    const mapperProp = objExpr.properties.find(prop => {
-      const key =
-        prop.key.type === 'Identifier' ? prop.key.name : prop.key.value;
-      return key === 'moduleNameMapper';
-    });
-
-    if (mapperProp?.value.type === 'ObjectExpression') {
-      mapperProp.value.properties.forEach(inner => {
-        if (inner.key.type === 'Literal') {
-          const original = inner.key.value;
-          let anchored = String(original);
-          if (!anchored.startsWith('^')) anchored = `^${anchored}`;
-          if (!anchored.endsWith('$')) anchored = `${anchored}$`;
-          inner.key.value = anchored;
-          console.debug(
-            `[transform-jest-config] • anchored "${original}" → "${anchored}"`
-          );
-        }
+    let ast;
+    try {
+      ast = parse(src, {
+        sourceType: "unambiguous",
+        plugins: ["jsx", "typescript"]
       });
+    } catch (err) {
+      error("  ❌ parse failed:", err.message);
+      failed++;
+      continue;
     }
-  }
 
-  // Handle CommonJS: module.exports = { … }
-  root
-    .find(j.AssignmentExpression, {
-      left: { object: { name: 'module' }, property: { name: 'exports' } }
-    })
-    .forEach(path => {
-      console.debug('[transform-jest-config] ✔ Found CommonJS export');
-      if (path.node.right.type === 'ObjectExpression') {
-        processConfig(path.node.right);
+    // Locate the exported config object
+    let cfgNode = null;
+    traverse(ast, {
+      ExportDefaultDeclaration(path) {
+        if (t.isObjectExpression(path.node.declaration)) {
+          cfgNode = path.node.declaration;
+          path.stop();
+        }
+      },
+      AssignmentExpression(path) {
+        // module.exports = { ... }
+        const { left, right } = path.node;
+        if (
+          t.isMemberExpression(left) &&
+          t.isIdentifier(left.object, { name: "module" }) &&
+          t.isIdentifier(left.property, { name: "exports" }) &&
+          t.isObjectExpression(right)
+        ) {
+          cfgNode = right;
+          path.stop();
+        }
       }
     });
 
-  // Handle ESM: export default { … }
-  root
-    .find(j.ExportDefaultDeclaration, {
-      declaration: { type: 'ObjectExpression' }
-    })
-    .forEach(path => {
-      console.debug('[transform-jest-config] ✔ Found ESM export default');
-      processConfig(path.node.declaration);
+    if (!cfgNode) {
+      log("  ↪ no config object found, skipping");
+      continue;
+    }
+
+    let changed = false;
+
+    // Remove testEnvironment and transform properties
+    cfgNode.properties = cfgNode.properties.filter(prop => {
+      if (!t.isObjectProperty(prop) || !t.isIdentifier(prop.key)) return true;
+      const k = prop.key.name;
+      if (k === "testEnvironment" || k === "transform") {
+        log(`   ✓ removed "${k}"`);
+        changed = true;
+        return false;
+      }
+      return true;
     });
 
-  const output = root.toSource({ quote: 'single' });
-  console.debug(
-    `[transform-jest-config] ✔ Completed ${fileInfo.path}; output length ${output.length}`
-  );
-  return output;
-}
+    // Ensure testMatch property
+    const existingTM = cfgNode.properties.find(prop =>
+      t.isObjectProperty(prop) &&
+      ((t.isIdentifier(prop.key) && prop.key.name === "testMatch") ||
+       (t.isStringLiteral(prop.key) && prop.key.value === "testMatch"))
+    );
+    if (existingTM) {
+      // Replace its value
+      existingTM.value = t.arrayExpression(testMatchPatterns);
+      log("   ✓ replaced testMatch");
+      changed = true;
+    } else {
+      // Insert before first other property
+      const tmProp = t.objectProperty(t.identifier("testMatch"), t.arrayExpression(testMatchPatterns));
+      cfgNode.properties.unshift(tmProp);
+      log("   ✓ added testMatch");
+      changed = true;
+    }
 
-async function run() {
-  console.debug('[transform-jest-config] 🚀 Starting Bun-driven codemod scan');
+    // Process moduleNameMapper
+    const mnmProp = cfgNode.properties.find(prop =>
+      t.isObjectProperty(prop) &&
+      ((t.isIdentifier(prop.key) && prop.key.name === "moduleNameMapper") ||
+       (t.isStringLiteral(prop.key) && prop.key.value === "moduleNameMapper"))
+    );
+    if (mnmProp && t.isObjectExpression(mnmProp.value)) {
+      for (const subProp of mnmProp.value.properties) {
+        if (t.isObjectProperty(subProp)) {
+          // Determine raw key name
+          let rawKey = t.isIdentifier(subProp.key)
+            ? subProp.key.name
+            : t.isStringLiteral(subProp.key)
+              ? subProp.key.value
+              : null;
+          if (rawKey) {
+            let anchored = rawKey;
+            if (!anchored.startsWith("^")) anchored = "^" + anchored;
+            if (!anchored.endsWith("$")) anchored = anchored + "$";
+            if (rawKey !== anchored) {
+              subProp.key = t.stringLiteral(anchored);
+              log(`   ✓ anchored moduleNameMapper key: "${rawKey}" → "${anchored}"`);
+              changed = true;
+            }
+          }
+        }
+      }
+    }
 
-  for await (const entry of Bun.scandir('.', { recursive: true })) {
-    if (!entry.isFile) continue;
-    const p = entry.path;
+    // If nothing changed, skip writing
+    if (!changed) {
+      log("   ↪ no changes needed");
+      continue;
+    }
 
-    // match api/jest.config.js exactly or any packages/**/jest.config.*
-    if (
-      p === 'api/jest.config.js' ||
-      /^packages\/.+\/jest\.config\.(js|mjs|cjs)$/.test(p)
-    ) {
-      const src = await Bun.file(p).text();
-      const transformed = transformer(
-        { path: p, source: src },
-        { jscodeshift }
-      );
+    // Generate code
+    const output = generate(ast, {
+      retainLines: true,
+      comments: true,
+      concise: false
+    }).code;
 
-      if (transformed !== src) {
-        await Bun.write(p, transformed);
-        console.debug(`[transform-jest-config] ✔ Updated ${p}`);
-      } else {
-        console.debug(`[transform-jest-config] ○ No changes for ${p}`);
+    if (dryRun) {
+      log("   (dry-run) skipped write");
+    } else {
+      try {
+        await Bun.write(absFile, output);
+        log("   ✔ written");
+      } catch (err) {
+        error("  ❌ write failed:", err.message);
+        failed++;
       }
     }
   }
 
-  console.debug('[transform-jest-config] 🎉 All done');
+  log(`\n✔ transform-jest-config: processed=${processed}, failed=${failed}`);
+  if (failed) Bun.exit(1);
 }
 
-if (import.meta.main) {
-  run().catch(err => {
-    console.error('[transform-jest-config] ❌ Error:', err);
-    process.exit(1);
-  });
-}
+main().catch(err => {
+  console.error("‼ transform-jest-config crashed:", err);
+  Bun.exit(1);
+});

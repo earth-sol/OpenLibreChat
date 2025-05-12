@@ -1,216 +1,264 @@
 #!/usr/bin/env bun
+
 /**
- * codemods/transform-docker-compose.js
- * Bun-native, plugin-driven, always-verbose, path-free Docker Compose transforms.
+ * transform-docker-compose.js
+ *
+ * - Scans root for compose files via Bun.Glob:
+ *     docker-compose.yml
+ *     deploy-compose.yml
+ *     docker-compose.override.yml
+ *     docker-compose.override.yml.example
+ *     rag.yml
+ * - Fully async I/O: Bun.file().text(), Bun.file().copy(), Bun.write()
+ * - CLI flags:
+ *     --dry-run    Preview changes without writing
+ *     --quiet      Suppress logs
+ *     --silent     Alias for --quiet
+ *     -h, --help   Show this help
+ * - Idempotent: skips files containing "# bun: docker-compose-updated"
+ * - Uses YAML for parsing/dumping, with a marker comment at top on write
+ * - Plugins:
+ *     imagePlugin, commandPlugin, envPlugin, healthPlugin
  */
 
-import yaml from 'js-yaml'
+import { Glob } from "bun";
+import path from "path";
+import YAML from "yaml";
 
-// ─── Config ───────────────────────────────────────────────────────────────────
-const DEFAULT_PATTERNS = [
-  'docker-compose.yml',
-  'deploy-compose.yml',
-  'docker-compose.override.yml*',
-  'rag.yml'
-]
-const GLOBS = (Bun.env.COMPOSE_GLOBS?.split(',') || DEFAULT_PATTERNS).map(s => s.trim())
-const BACKUP_SUFFIX = Bun.env.BACKUP_SUFFIX || '.bak'
-const MIN_DEPENDS_ON = 3.9
+async function main() {
+  const args   = Bun.argv.slice(1);
+  const dryRun = args.includes("--dry")    || args.includes("--dry-run");
+  const quiet  = args.includes("--quiet")  || args.includes("--silent");
+  const help   = args.includes("-h")       || args.includes("--help");
+  if (help) {
+    console.log(`
+Usage: transform-docker-compose.js [options]
 
-// ─── Logger ───────────────────────────────────────────────────────────────────
-function debug(...args) {
-  console.log('[debug]', ...args)
-}
-
-// ─── YAML I/O ─────────────────────────────────────────────────────────────────
-function loadYAML(filePath) {
-  debug('Reading YAML from', filePath)
-  return yaml.load(Bun.file(filePath).textSync()) || {}
-}
-
-function dumpYAML(filePath, doc) {
-  debug('Writing YAML to', filePath)
-  Bun.write(filePath, yaml.dump(doc, { lineWidth: -1 }))
-}
-
-// ─── Transformer scaffolding ─────────────────────────────────────────────────
-class Transformer {
-  constructor() { this.plugins = [] }
-
-  use(fn) {
-    debug('Registering plugin', fn.name)
-    this.plugins.push(fn)
-    return this
+Options:
+  --dry-run, --dry      Preview changes without writing
+  --quiet, --silent     Suppress output
+  -h, --help            Show this help
+`);
+    Bun.exit(0);
   }
 
-  async transformOne(file) {
-    debug('---\nProcessing file:', file)
+  const log   = (...m) => { if (!quiet) console.log(...m) };
+  const debug = (...m) => { if (!quiet) console.debug(...m) };
+  const error = (...m) => console.error(...m);
 
-    // 1) Backup
-    const bak = file + BACKUP_SUFFIX
-    if (!Bun.file(bak).existsSync()) {
-      Bun.file(file).copySync(bak)
-      console.log(`• backed up ${file} → ${bak}`)
+  log("▶ transform-docker-compose: starting", dryRun ? "(dry-run)" : "");
+
+  // Marker for idempotence
+  const MARKER = "# bun: docker-compose-updated";
+
+  // Project root (LibreChat-main)
+  const rootUrl = new URL("../../LibreChat-main", import.meta.url);
+  const root    = Bun.fileURLToPath(rootUrl);
+
+  // Compose file patterns
+  const PATTERNS = [
+    "docker-compose.yml",
+    "deploy-compose.yml",
+    "docker-compose.override.yml",
+    "docker-compose.override.yml.example",
+    "rag.yml"
+  ];
+
+  // Discover files
+  const files = new Set();
+  for (const pat of PATTERNS) {
+    const glob = new Glob(pat);
+    for await (const rel of glob.scan({ cwd: root, absolute: false, onlyFiles: true })) {
+      files.add(rel);
+    }
+  }
+
+  let processed = 0, failed = 0;
+  for (const rel of files) {
+    processed++;
+    log(`\n→ ${rel}`);
+    const filePath = path.join(root, rel);
+
+    // Read source
+    let src;
+    try {
+      src = await Bun.file(filePath).text();
+    } catch (err) {
+      error("  ❌ read failed:", err.message);
+      failed++;
+      continue;
+    }
+
+    // Skip already transformed
+    if (src.includes(MARKER)) {
+      log("  ↪ already transformed");
+      continue;
+    }
+
+    // Backup
+    const bakPath = filePath + ".bak";
+    try {
+      if (!dryRun && !(await Bun.file(bakPath).exists())) {
+        await Bun.file(filePath).copy(bakPath);
+        debug("  backup created:", bakPath);
+      }
+    } catch (err) {
+      error("  ⚠ backup failed:", err.message);
+    }
+
+    // Parse YAML
+    let doc;
+    try {
+      doc = YAML.parse(src) || {};
+    } catch (err) {
+      error("  ❌ YAML parse failed:", err.message);
+      failed++;
+      continue;
+    }
+
+    // Apply plugins
+    let changed = false;
+    try {
+      ({ doc, changed } = applyPlugins(doc, { debug, log }));
+    } catch (err) {
+      error("  ❌ plugin pipeline error:", err.message);
+      failed++;
+      continue;
+    }
+
+    if (!changed) {
+      log("  ↪ no changes");
+      continue;
+    }
+
+    // Generate output with marker
+    const out = MARKER + "\n" + YAML.stringify(doc, { lineWidth: -1 });
+    if (dryRun) {
+      log("  (dry-run) would write changes");
     } else {
-      debug('Backup already exists, skipping:', bak)
-    }
-
-    // 2) Load
-    let doc = loadYAML(file)
-
-    // 3) Plugins
-    for (let plugin of this.plugins) {
-      debug(`Plugin start: ${plugin.name}`)
       try {
-        const result = await plugin(doc, file)
-        if (result) doc = result
+        await Bun.write(filePath, out);
+        log("  ✔ written");
       } catch (err) {
-        console.error(`⁉ Error in plugin ${plugin.name} for ${file}:`, err)
-      }
-      debug(`Plugin end:   ${plugin.name}`)
-    }
-
-    // 4) Dump
-    dumpYAML(file, doc)
-    console.log(`✔ transformed ${file}`)
-  }
-
-  async run() {
-    debug('Using glob patterns:', GLOBS)
-    const files = new Set()
-    for (let pat of GLOBS) {
-      for await (let entry of new Bun.Glob(pat)) {
-        debug('Matched file:', entry.path)
-        files.add(entry.path)
+        error("  ❌ write failed:", err.message);
+        failed++;
       }
     }
-    if (!files.size) {
-      console.warn('⚠ No Docker Compose files found for patterns:', GLOBS)
-      return
-    }
-    console.log(`→ Found ${files.size} compose file(s).`)
-    for (let f of files) {
-      await this.transformOne(f)
-    }
   }
+
+  log(`\n✔ done. processed=${processed}, failed=${failed}`);
+  if (failed) Bun.exit(1);
 }
 
-// ─── Built-in plugins ─────────────────────────────────────────────────────────
+/**
+ * Runs each plugin, returning { doc, changed }
+ */
+function applyPlugins(doc, { debug, log }) {
+  let changed = false;
+  const svcs = doc.services || {};
 
-// 1) Image rewrite & build injection
-async function imagePlugin(doc) {
-  debug('imagePlugin running')
-  const svcs = doc.services || {}
-  for (let [name, svc] of Object.entries(svcs)) {
-    if (typeof svc.image === 'string' && svc.image.startsWith('ghcr.io/danny-avila/librechat')) {
-      const tag = Bun.env.IMAGE_TAG ?? 'latest'
-      let repo
-      if (name === 'api') repo = Bun.env.IMAGE_REPO ?? 'myregistry/librechat-bun'
-      else if (['rag_api','rag-api'].includes(name))
-        repo = Bun.env.RAG_IMAGE_REPO ?? 'myregistry/librechat-rag-api-bun'
+  // ─── imagePlugin ─────────────────────────────────────────────────────────────
+  debug("imagePlugin running");
+  for (const [name, svc] of Object.entries(svcs)) {
+    if (typeof svc.image === "string" && svc.image.startsWith("ghcr.io/danny-avila/librechat")) {
+      const tag = Bun.env.IMAGE_TAG ?? "latest";
+      let repo;
+      if (name === "api") repo = Bun.env.IMAGE_REPO ?? "myregistry/librechat-bun";
+      else if (["rag_api", "rag-api"].includes(name))
+        repo = Bun.env.RAG_IMAGE_REPO ?? "myregistry/librechat-rag-api-bun";
       if (repo) {
-        debug(`Rewriting image for ${name}:`, svc.image, '→', `${repo}:${tag}`)
-        svc.image = `${repo}:${tag}`
-
+        debug(`  Rewriting image for ${name}: ${svc.image} → ${repo}:${tag}`);
+        svc.image = `${repo}:${tag}`;
         if (!svc.build) {
-          const df = Bun.file('Dockerfile.multi').existsSync() && name !== 'api'
-            ? 'Dockerfile.multi'
-            : 'Dockerfile'
-          debug(`Injecting build section for ${name} with Dockerfile "${df}"`)
           svc.build = {
-            context: '.',
-            dockerfile: df,
-            ...(df === 'Dockerfile.multi'
-              ? { target: name === 'api' ? 'api-build' : undefined }
-              : {})
-          }
+            context: ".",
+            dockerfile: name === "api" ? "Dockerfile" : "Dockerfile.multi"
+          };
+          debug(`  Added build config to ${name}`);
+        }
+        changed = true;
+      }
+    }
+  }
+
+  // ─── commandPlugin ────────────────────────────────────────────────────────────
+  debug("commandPlugin running");
+  const rewrite = str =>
+    str.replace(/\bnpm install\b/g, "bun install")
+       .replace(/\bnpm run\b/g,     "bun run")
+       .replace(/\byarn install\b/g,"bun install")
+       .replace(/\bnode\b/g,        "bun");
+  for (const svc of Object.values(svcs)) {
+    if (svc.command) {
+      debug("  Original command:", svc.command);
+      if (typeof svc.command === "string") {
+        const updated = rewrite(svc.command);
+        if (updated !== svc.command) {
+          svc.command = updated;
+          debug("  Rewritten command:", svc.command);
+          changed = true;
+        }
+      } else if (Array.isArray(svc.command)) {
+        const updatedArr = svc.command.map(rewrite);
+        if (!Bun.deepEquals(updatedArr, svc.command)) {
+          svc.command = updatedArr;
+          debug("  Rewritten command array:", svc.command);
+          changed = true;
         }
       }
     }
   }
-  return doc
-}
 
-// 2) Command rewrite to Bun
-async function commandPlugin(doc) {
-  debug('commandPlugin running')
-  const svcs = doc.services || {}
-  const rewrite = str => str
-    .replace(/\bnpm install\b/g, 'bun install')
-    .replace(/\bnpm run\b/g,     'bun run')
-    .replace(/\byarn install\b/g,'bun install')
-    .replace(/\bnode\b/g,        'bun')
-
-  for (let svc of Object.values(svcs)) {
-    if (svc.command) {
-      debug('Original command:', svc.command)
-      if (typeof svc.command === 'string') svc.command = rewrite(svc.command)
-      else if (Array.isArray(svc.command)) svc.command = svc.command.map(rewrite)
-      debug('Rewritten command:', svc.command)
+  // ─── envPlugin ────────────────────────────────────────────────────────────────
+  debug("envPlugin running");
+  const apiSvc = doc.services?.api;
+  if (apiSvc) {
+    apiSvc.volumes = Array.isArray(apiSvc.volumes) ? apiSvc.volumes : [];
+    const hasEnv = apiSvc.volumes.some(v =>
+      typeof v === "string" ? v.includes(".env") : v.target === "/app/.env"
+    );
+    if (!hasEnv) {
+      debug("  Injecting .env mount into api service");
+      const entry = apiSvc.volumes.some(v => typeof v === "object")
+        ? { type: "bind", source: "./.env", target: "/app/.env" }
+        : "./.env:/app/.env";
+      apiSvc.volumes.unshift(entry);
+      changed = true;
     }
   }
-  return doc
-}
 
-// 3) Ensure .env mount for API
-async function envPlugin(doc) {
-  debug('envPlugin running')
-  const svc = doc.services?.api
-  if (!svc) return doc
-
-  svc.volumes = svc.volumes || []
-  const hasEnv = svc.volumes.some(v =>
-    typeof v === 'string' ? v.includes('.env') : v.target === '/app/.env'
-  )
-  if (!hasEnv) {
-    debug('Injecting .env mount into api service')
-    const entry = svc.volumes.some(v => typeof v === 'object')
-      ? { type: 'bind', source: './.env', target: '/app/.env' }
-      : './.env:/app/.env'
-    svc.volumes.unshift(entry)
-  }
-  return doc
-}
-
-// 4) HTTP healthcheck + modern depends_on
-async function healthPlugin(doc) {
-  debug('healthPlugin running')
-  const version = parseFloat(doc.version || '0')
-  for (let [name, svc] of Object.entries(doc.services || {})) {
-    if (['api','rag_api','rag-api'].includes(name) && !svc.healthcheck) {
-      debug(`Adding healthcheck to "${name}"`)
-      let port = '3080'
-      if (svc.ports?.length) port = svc.ports[0].toString().split(':').pop()
+  // ─── healthPlugin ───────────────────────────────────────────────────────────
+  debug("healthPlugin running");
+  const version       = parseFloat(doc.version || "0");
+  const MIN_DEPENDS_ON = 3.9;
+  for (const [name, svc] of Object.entries(svcs)) {
+    if (["api", "rag_api", "rag-api"].includes(name) && !svc.healthcheck) {
+      debug(`  Adding healthcheck to "${name}"`);
+      let port = "3080";
+      if (Array.isArray(svc.ports) && svc.ports.length) {
+        port = svc.ports[0].toString().split(":").pop();
+      }
       svc.healthcheck = {
-        test: ['CMD-SHELL', `curl -f http://localhost:${port}/health || exit 1`],
-        interval: '30s',
-        timeout: '10s',
+        test: ["CMD-SHELL", `curl -f http://localhost:${port}/health || exit 1`],
+        interval: "30s",
+        timeout: "10s",
         retries: 5
-      }
+      };
+      changed = true;
       if (version >= MIN_DEPENDS_ON && Array.isArray(svc.depends_on)) {
-        debug(`Converting depends_on for "${name}" to service_healthy conditions`)
-        const obj = {}
-        for (let d of svc.depends_on) obj[d] = { condition: 'service_healthy' }
-        svc.depends_on = obj
+        debug(`  Converting depends_on for "${name}" to service_healthy conditions`);
+        const obj = {};
+        for (const d of svc.depends_on) obj[d] = { condition: "service_healthy" };
+        svc.depends_on = obj;
+        changed = true;
       }
     }
   }
-  if (!doc.version) {
-    debug('Setting default compose version to 3.8')
-    doc.version = '3.8'
-  }
-  return doc
+
+  return { doc, changed };
 }
 
-// ─── Execute transformer ──────────────────────────────────────────────────────
-new Transformer()
-  .use(imagePlugin)
-  .use(commandPlugin)
-  .use(envPlugin)
-  .use(healthPlugin)
-  // → add custom plugins here via .use(yourPlugin)
-  .run()
-  .catch(err => {
-    console.error('❌ transform-docker-compose failed:', err)
-    process.exit(1)
-  })
+main().catch(err => {
+  console.error("‼ transform-docker-compose crashed:", err);
+  Bun.exit(1);
+});

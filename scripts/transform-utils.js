@@ -1,126 +1,100 @@
 #!/usr/bin/env bun
-/**
- * scripts/transform-utils.js
- * --------------------------------
- * Bun-native CLI to codemod shell scripts:
- * - Replace npm, npx, yarn calls with bun, bunx.
- * - Safe backups (`.bak` files).
- * - Logs Bun version.
- * - Fully Bun Core APIs, pure JavaScript.
- */
-
-/**
- * @param {string} msg
- */
-function print(msg) {
-  console.log(`ℹ️  ${msg}`);
-}
-
-/**
- * @param {string} msg
- */
-function success(msg) {
-  console.log(`✅ ${msg}`);
-}
-
-/**
- * @param {string} msg
- */
-function warn(msg) {
-  console.warn(`⚠️  ${msg}`);
-}
-
-/**
- * @param {string} msg
- */
-function error(msg) {
-  console.error(`❌ ${msg}`);
-  Bun.exit(1);
-}
-
-/**
- * Check if an executable exists in PATH.
- * @param {string} name
- * @returns {boolean}
- */
-function checkExecutable(name) {
-  const res = Bun.spawnSync(["which", name], { stdout: "ignore", stderr: "ignore" });
-  return res.exitCode === 0;
-}
-
-/**
- * @returns {Promise<string[]>}
- */
-async function findShellScripts() {
-  const glob = new Bun.Glob("**/*.sh");
-  const matches = await glob.scan({
-    cwd: Bun.env.PWD || ".",
-    absolute: true,
-  });
-  return matches.filter(path =>
-    path.includes("/utils/") ||
-    path.includes("/packages/") ||
-    path.includes("/client/")
-  );
-}
-
-/**
- * Transform a single file in place, backing up original.
- * @param {string} filePath
- */
-async function transformFile(filePath) {
-  const file = Bun.file(filePath);
-  if (!(await file.exists())) {
-    warn(`Skipping missing file: ${filePath}`);
-    return;
-  }
-
-  const original = await file.text();
-  const transformed = original
-    .replace(/\bnpm view\b/g, "bun pm info")
-    .replace(/\bnpm ci\b/g, "bun install --frozen-lockfile")
-    .replace(/\bnpm install\b/g, "bun install")
-    .replace(/\bnpm test\b/g, "bun test")
-    .replace(/\bnpm run\b/g, "bun run")
-    .replace(/\bnpx\b/g, "bunx")
-    .replace(/\byarn add\b/g, "bun add")
-    .replace(/\byarn init\b/g, "bun init")
-    .replace(/\byarn\b/g, "bun");
-
-  if (transformed === original) {
-    print(`No changes needed: ${filePath}`);
-    return;
-  }
-
-  const backupPath = `${filePath}.bak`;
-  await Bun.write(backupPath, original);
-  print(`Backup created: ${backupPath}`);
-
-  await Bun.write(filePath, transformed);
-  success(`Transformed: ${filePath}`);
-}
 
 async function main() {
-  // Validate Bun
-  if (!checkExecutable("bun")) {
-    error("Bun is not installed. Please install Bun: https://bun.sh/");
-  }
-  const bunVer = Bun.spawnSync(["bun", "--version"], { stdout: "pipe" }).stdout.toString().trim();
-  print(`Bun version: ${bunVer}`);
+  // ─── CLI FLAGS ──────────────────────────────────────────────────────────────
+  const args   = Bun.argv.slice(1);
+  const dryRun = args.includes("--dry")    || args.includes("--dry-run");
+  const quiet  = args.includes("--quiet")  || args.includes("--silent");
+  const help   = args.includes("-h")       || args.includes("--help");
 
-  print("Scanning for shell scripts to transform...");
-  const scripts = await findShellScripts();
-  if (scripts.length === 0) {
-    warn("No shell scripts found under utils/, packages/, or client/.");
-    return;
-  }
-  print(`Found ${scripts.length} shell scripts.`);
+  if (help) {
+    console.log(`
+Usage: transform-utils.js [options]
 
-  for (const script of scripts) {
-    await transformFile(script);
+Options:
+  --dry-run, --dry    Preview without writing files
+  --quiet, --silent   Suppress all output
+  -h, --help          Show this help
+`);
+    Bun.exit(0);
   }
 
-  success("All shell scripts processed.");
+  const log   = (...m) => { if (!quiet) console.log(...m) };
+  const debug = (...m) => { if (!quiet) console.debug(...m) };
+
+  log("▶ transform-utils: starting");
+
+  // ─── PROJECT ROOT ────────────────────────────────────────────────────────────
+  const rootUrl  = new URL("../", import.meta.url);   // repo root
+  const rootPath = Bun.fileURLToPath(rootUrl);
+
+  // ─── FIND SHELL SCRIPTS ─────────────────────────────────────────────────────
+  const glob = new Bun.Glob("utils/**/*.sh");
+  let processed = 0, updated = 0, skipped = 0, errors = 0;
+
+  for await (const absPath of glob.scan({ cwd: rootPath, absolute: true, onlyFiles: true })) {
+    processed++;
+    debug(`\n[+] Processing ${absPath}`);
+
+    let original;
+    try {
+      original = await Bun.file(absPath).text();
+    } catch (err) {
+      console.error(`❌ Read failed: ${absPath}`, err.message);
+      errors++;
+      continue;
+    }
+
+    let transformed = original;
+
+    // ─── APPLY REPPLACEMENTS ───────────────────────────────────────────────────
+    // Npx → bunx
+    transformed = transformed.replace(/\bnpx\b/g, "bunx");
+
+    // npm → bun
+    transformed = transformed
+      .replace(/\bnpm\s+ci\b/g, "bun install")
+      .replace(/\bnpm\s+install\b/g, "bun install")
+      .replace(/\bnpm\s+run\b/g, "bun run")
+      .replace(/\bnpm\b/g,      "bun");
+
+    // yarn → bun
+    transformed = transformed
+      .replace(/\byarn\s+global\s+add\b/g, "bun add")
+      .replace(/\byarn\s+add\b/g,          "bun add")
+      .replace(/\byarn\s+install\b/g,      "bun install")
+      .replace(/\byarn\s+run\b/g,          "bun run")
+      .replace(/\byarn\s+(\S+)/g,          "bun run $1");
+
+    // ─── SKIP IF NO CHANGES ────────────────────────────────────────────────────
+    if (transformed === original) {
+      debug(`   ↪ no npm/yarn/npx usages found, skipping`);
+      skipped++;
+      continue;
+    }
+
+    // ─── WRITE OR DRY-RUN ──────────────────────────────────────────────────────
+    if (dryRun) {
+      log(`   (dry-run) would update: ${absPath}`);
+      updated++;
+    } else {
+      try {
+        await Bun.write(absPath, transformed);
+        log(`   ✔ updated: ${absPath}`);
+        updated++;
+      } catch (err) {
+        console.error(`❌ Write failed: ${absPath}`, err.message);
+        errors++;
+      }
+    }
+  }
+
+  // ─── SUMMARY & EXIT ─────────────────────────────────────────────────────────
+  log(`\n✔ transform-utils: done. processed=${processed}, updated=${updated}, skipped=${skipped}, errors=${errors}`);
+  if (errors > 0) Bun.exit(1);
 }
 
-main().catch(err => { error(err.message || String(err)); });
+main().catch(err => {
+  console.error("‼ transform-utils crashed:", err);
+  Bun.exit(1);
+});

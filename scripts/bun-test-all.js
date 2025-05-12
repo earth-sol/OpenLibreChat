@@ -1,123 +1,105 @@
 #!/usr/bin/env bun
+
 /**
- * scripts/bun-test-all.js
- * --------------------------------
- * Bun-native CLI to run all tests across a monorepo.
- * - Discovers package.json via Bun.Glob, skipping node_modules and hidden dirs
- * - Supports --watch/-w, --jobs/-j <n>, --help flags and BUN_TEST_WATCH, BUN_TEST_JOBS env
- * - Runs tests with concurrency, with coverage by default
- * - Uses Bun Core APIs: Glob, spawn, fileURLToPath, exit, color, version, revision
- * - Reports per-package pass/fail and overall summary
+ * Recursively discovers all test files via Bun.Glob and runs them
+ * under Bun’s test runner. 
+ * 
+ * ✔ Uses Bun.Glob for native file matching
+ * ✔ Spawns a single `bun test` with explicit file list
+ * ✔ Verbose by default (pass --quiet or --silent to suppress)
+ * ✔ Supports --dry-run to preview without running tests
+ * ✔ Graceful failure reporting, non-zero exit if tests fail
  */
 
-import { Glob } from "bun";
-import { fileURLToPath } from "bun:path";
+async function main() {
+  // ─── CLI FLAGS ──────────────────────────────────────────────────────────────
+  const args   = Bun.argv.slice(1);
+  const dryRun = args.includes("--dry")    || args.includes("--dry-run");
+  const quiet  = args.includes("--quiet")  || args.includes("--silent");
+  const help   = args.includes("-h")       || args.includes("--help");
 
-/** Parse CLI args and env flags */
-function parseArgs(argv) {
-  const options = {};
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i];
-    if (arg === "--help" || arg === "-h") {
-      options.help = true;
-    } else if (arg === "--watch" || arg === "-w") {
-      options.watch = true;
-    } else if (arg === "--jobs" || arg === "-j") {
-      const next = argv[i + 1];
-      if (next && !next.startsWith("-")) {
-        options.jobs = Math.max(1, parseInt(next, 10) || 1);
-        i++;
-      } else {
-        options.jobs = 1;
-      }
-    }
-  }
-  // Env overrides
-  if (Bun.env.BUN_TEST_WATCH === "1") options.watch = true;
-  if (!options.jobs && Bun.env.BUN_TEST_JOBS) {
-    options.jobs = Math.max(1, parseInt(Bun.env.BUN_TEST_JOBS, 10) || 1);
-  }
-  options.jobs = options.jobs || 1;
-  return options;
-}
-
-const options = parseArgs(Bun.argv.slice(2));
-if (options.help) {
-  console.log(`
-Usage: bun run scripts/bun-test-all.js [options]
+  if (help) {
+    console.log(`
+Usage: bun-test-all.js [options]
 
 Options:
-  -w, --watch           Run tests in watch mode
-  -j, --jobs <number>   Number of concurrent test batches (default: 1)
-  -h, --help            Show this help and exit
-
-Env:
-  BUN_TEST_WATCH=1      Same as --watch
-  BUN_TEST_JOBS=<n>     Same as --jobs <n>
-`.trim());
-  Bun.exit(0);
-}
-
-// Print metadata
-const projectRoot = fileURLToPath(new URL("..", import.meta.url));
-console.log(Bun.color(`bun-test-all.js v${Bun.version} (rev ${Bun.revision})`, "cyan"));
-console.log(`[INFO] Project root: ${projectRoot}`);
-console.log(`[INFO] Concurrency: ${options.jobs}, Watch: ${Boolean(options.watch)}`);
-
-/** Discover all package.json files under the repo */
-async function discoverPackages() {
-  const glob = new Glob("**/package.json", {
-    root: projectRoot,
-    ignore: ["**/node_modules/**", "**/.*"]
-  });
-  const files = [];
-  for await (const file of glob.scan()) {
-    files.push(file);
-  }
-  return files;
-}
-
-(async () => {
-  const pkgFiles = await discoverPackages();
-  console.log(`[DEBUG] Found ${pkgFiles.length} package.json files`);
-
-  // Build base test command
-  const baseCmd = ["bun", "test", "--coverage"];
-  if (options.watch) baseCmd.push("--watch");
-  console.log(`[DEBUG] Test command: ${baseCmd.join(" ")}`);
-
-  const failures = [];
-
-  // Run tests in batches of `jobs`
-  for (let i = 0; i < pkgFiles.length; i += options.jobs) {
-    const batch = pkgFiles.slice(i, i + options.jobs).map(async pkgPath => {
-      // Derive workspace dir
-      const dir = pkgPath.slice(0, -"package.json".length);
-      console.log(`[DEBUG] Testing in ${dir}`);
-
-      const proc = Bun.spawn({
-        cmd: baseCmd,
-        cwd: dir,
-        stdout: "inherit",
-        stderr: "inherit"
-      });
-      const { exitCode } = await proc.exited;
-      if (exitCode !== 0) {
-        console.log(Bun.color(`FAILED in ${dir} (code ${exitCode})`, "red"));
-        failures.push({ dir, code: exitCode });
-      } else {
-        console.log(Bun.color(`PASSED in ${dir}`, "green"));
-      }
-    });
-    await Promise.all(batch);
-  }
-
-  // Summary
-  if (failures.length > 0) {
-    console.log(Bun.color(`\n${failures.length} failure(s) detected`, "red"));
-    Bun.exit(1);
-  } else {
-    console.log(Bun.color(`\nAll tests passed!`, "green"));
+  --dry-run, --dry      Preview which tests would run without executing
+  --quiet, --silent     Suppress all output
+  -h, --help            Show this help
+`);
     Bun.exit(0);
   }
-})();
+
+  const log   = (...m) => { if (!quiet) console.log(...m) };
+  const error = (...m) => console.error(...m);
+  const debug = (...m) => { if (!quiet) console.debug(...m) };
+
+  log("▶ bun-test-all: starting");
+
+  // ─── PROJECT ROOT ────────────────────────────────────────────────────────────
+  // Script lives in scripts/, so root is one level up
+  const rootUrl  = new URL("../", import.meta.url);
+  const rootPath = Bun.fileURLToPath(rootUrl);
+
+  // ─── TEST PATTERNS ──────────────────────────────────────────────────────────
+  // These mirror your JSON plan's testPatterns
+  const patterns = [
+    "api/test/**/*.{spec,test}.js",
+    "client/test/**/*.{spec,test}.tsx",
+    "packages/**/test/**/*.{spec,test}.{js,ts,tsx}",
+    "e2e/specs/**/*.{spec,test}.{js,ts}"
+  ];
+
+  // ─── DISCOVER TEST FILES ────────────────────────────────────────────────────
+  const testFiles = new Set();
+
+  for (const pattern of patterns) {
+    debug(`Scanning pattern: ${pattern}`);
+    const glob = new Bun.Glob(pattern);
+    for await (const relPath of glob.scan({ cwd: rootPath, absolute: true, onlyFiles: true })) {
+      testFiles.add(relPath);
+    }
+  }
+
+  if (testFiles.size === 0) {
+    log("⚠ No test files found, nothing to run.");
+    Bun.exit(0);
+  }
+
+  // Convert to array
+  const files = Array.from(testFiles);
+
+  log(`Discovered ${files.length} test file(s).\n`);
+
+  if (dryRun) {
+    log("⚙️  Dry-run mode, would run:");
+    for (const f of files) log("  -", f.replace(`${rootPath}/`, ""));
+    Bun.exit(0);
+  }
+
+  // ─── RUN BUN TEST ────────────────────────────────────────────────────────────
+  log("→ Running bun test on all discovered files...\n");
+  const cmd = ["bun", "test", ...files];
+  debug("Command:", cmd.join(" "));
+
+  const proc = Bun.spawn({
+    cmd,
+    cwd: rootPath,
+    stdout: "inherit",
+    stderr: "inherit"
+  });
+
+  const { exitCode } = await proc.exited;
+
+  if (exitCode !== 0) {
+    error(`\n❌ bun-test-all: some tests failed (exit ${exitCode})`);
+    Bun.exit(exitCode);
+  } else {
+    log("\n✔ bun-test-all: all tests passed");
+  }
+}
+
+main().catch(err => {
+  console.error("‼ bun-test-all crashed:", err);
+  Bun.exit(1);
+});

@@ -1,197 +1,137 @@
 #!/usr/bin/env bun
-/**
- * scripts/check-updates.js
- * --------------------------------
- * Bun-native CLI to check for recent npm package releases.
- * - Auto-discovers package.json if none specified.
- * - Multi-package.json support.
- * - Dynamic window (days back).
- * - Output as JSON or text.
- * - Dry-run and strict mode.
- * - Pure JavaScript + JSDoc.
- */
 
 /**
- * @param {string} msg
+ * Scans every package.json in the repo (excluding node_modules and .git),
+ * and runs `bun outdated` (or `bun outdated --json`) to check for newer versions.
+ *
+ * ✔ Uses Bun.Glob for native file matching
+ * ✔ Uses Bun.spawn to invoke Bun’s own CLI
+ * ✔ Supports --format=text (default) or --format=json
+ * ✔ Verbose by default; use --quiet or --silent to suppress
+ * ✔ Supports --dry-run to preview without executing
+ * ✔ Graceful per-package error handling; exits non-zero if any outdated or errors
  */
-function print(msg) {
-  console.log(`ℹ️  ${msg}`);
-}
-
-/**
- * @param {string} msg
- */
-function success(msg) {
-  console.log(`✅ ${msg}`);
-}
-
-/**
- * @param {string} msg
- */
-function warn(msg) {
-  console.warn(`⚠️  ${msg}`);
-}
-
-/**
- * @param {string} msg
- */
-function error(msg) {
-  console.error(`❌ ${msg}`);
-  Bun.exit(1);
-}
-
-/**
- * Parses CLI arguments into options and positional args.
- * @param {string[]} args
- * @returns {{ options: Record<string,string>, positional: string[] }}
- */
-function parseArgs(args) {
-  const options = {};
-  const positional = [];
-  for (const arg of args) {
-    if (arg.startsWith("--days=")) {
-      options.days = arg.split("=")[1];
-    } else if (arg.startsWith("--format=")) {
-      options.format = arg.split("=")[1];
-    } else if (arg === "--dry-run") {
-      options.dryRun = "true";
-    } else if (arg === "--strict") {
-      options.strict = "true";
-    } else {
-      positional.push(arg);
-    }
-  }
-  return { options, positional };
-}
-
-/**
- * Finds all package.json files in the repo, excluding common build dirs.
- * @returns {Promise<string[]>}
- */
-async function findAllPackageJsons() {
-  const glob = new Bun.Glob("**/package.json");
-  const matches = await glob.scan({
-    cwd: Bun.env.PWD || ".",
-    absolute: true,
-  });
-  return matches.filter(path =>
-    !path.includes("node_modules/") &&
-    !path.includes("dist/") &&
-    !path.includes("build/") &&
-    !path.includes(".git/") &&
-    !path.includes("coverage/")
-  );
-}
-
-/**
- * Reads and parses a JSON file.
- * @param {string} path
- * @returns {Promise<any>}
- */
-async function readJson(path) {
-  const text = await Bun.file(path).text();
-  return JSON.parse(text);
-}
-
-/**
- * Returns a timestamp (ms) for X days ago.
- * @param {number} daysBack
- * @returns {number}
- */
-function daysAgoTimestamp(daysBack) {
-  return Date.now() - daysBack * 24 * 60 * 60 * 1000;
-}
-
-/**
- * Checks each package for new versions within daysBack.
- * @param {string[]} packages
- * @param {number} daysBack
- * @returns {Promise<{package:string,version:string,published:string}[]>}
- */
-async function checkPackageUpdates(packages, daysBack) {
-  const now = Date.now();
-  const cutoff = daysAgoTimestamp(daysBack);
-  const updates = [];
-  for (const pkg of packages) {
-    try {
-      const result = await $`bun pm info ${pkg} time --json`;
-      const times = JSON.parse(result.stdout.toString());
-      for (const [version, pubDate] of Object.entries(times)) {
-        if (typeof pubDate === "string") {
-          const t = new Date(pubDate).getTime();
-          if (t > cutoff && t <= now) {
-            updates.push({ package: pkg, version, published: pubDate });
-          }
-        }
-      }
-    } catch (e) {
-      warn(`Failed to fetch info for ${pkg}: ${e.message}`);
-    }
-  }
-  return updates;
-}
 
 async function main() {
-  // Ensure Bun is installed and log version
-  try {
-    const bunVer = Bun.spawnSync(["bun", "--version"], { stdout: "pipe" })
-      .stdout.toString().trim();
-    print(`Bun version: ${bunVer}`);
-  } catch {
-    error("Bun is not installed. Install from https://bun.sh/");
+  // ─── CLI FLAGS ──────────────────────────────────────────────────────────────
+  const args   = Bun.argv.slice(1);
+  const dryRun = args.includes("--dry")       || args.includes("--dry-run");
+  const quiet  = args.includes("--quiet")     || args.includes("--silent");
+  const help   = args.includes("-h")          || args.includes("--help");
+  const fmtArg = args.find(a => a.startsWith("--format="));
+  const format = fmtArg
+    ? fmtArg.split("=")[1]
+    : args.includes("--json")
+      ? "json"
+      : "text";
+
+  if (help) {
+    console.log(`
+Usage: check-updates.js [options]
+
+Options:
+  --format=text|json    Output format (default: text)
+  --json                Alias for --format=json
+  --dry-run, --dry      Preview which dirs would be checked
+  --quiet, --silent     Suppress logs
+  -h, --help            Show this help
+`);
+    Bun.exit(0);
   }
 
-  const { options, positional } = parseArgs(Bun.argv.slice(2));
-  const daysBack = parseInt(options.days || "3", 10);
-  const format = options.format || "text";
-  const dryRun = options.dryRun === "true";
-  const strict = options.strict === "true";
+  const log   = (...m) => { if (!quiet) console.log(...m) };
+  const error = (...m) => console.error(...m);
+  const debug = (...m) => { if (!quiet) console.debug(...m) };
 
-  let pkgPaths = positional;
-  if (pkgPaths.length === 0) {
-    print("No package.json paths provided; scanning project...");
-    pkgPaths = await findAllPackageJsons();
-    if (pkgPaths.length === 0) {
-      error("No package.json files found.");
+  log("▶ check-updates: starting in format:", format);
+
+  // ─── PROJECT ROOT ────────────────────────────────────────────────────────────
+  const rootUrl  = new URL("../", import.meta.url);
+  const rootPath = Bun.fileURLToPath(rootUrl);
+
+  // ─── COLLECT DIRECTORIES ──────────────────────────────────────────────────────
+  const dirs = new Set([rootPath]);
+  const pkgGlob = new Bun.Glob("**/package.json");
+  for await (const pkgPath of pkgGlob.scan({ cwd: rootPath, absolute: true, onlyFiles: true })) {
+    if (pkgPath.includes("/node_modules/") || pkgPath.includes("/.git/")) continue;
+    const idx = pkgPath.lastIndexOf("/");
+    const dir = idx >= 0 ? pkgPath.slice(0, idx) : rootPath;
+    dirs.add(dir);
+  }
+
+  // ─── RUN OUTDATED CHECKS ──────────────────────────────────────────────────────
+  let failures = 0;
+  const results = {}; // for JSON format
+
+  for (const dir of dirs) {
+    log(`\n→ Checking updates in ${dir}`);
+    if (dryRun) {
+      log("   (dry-run) would run: bun outdated" + (format === "json" ? " --json" : ""));
+      continue;
     }
-    print(`Found ${pkgPaths.length} package.json files.`);
+
+    // Build command
+    const cmd = ["bun", "outdated"];
+    if (format === "json") cmd.push("--json");
+
+    debug("   cmd:", cmd.join(" "));
+
+    const proc = Bun.spawn({
+      cmd,
+      cwd: dir,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    const { exitCode } = await proc.exited;
+    const out = await proc.stdout.text();
+    const err = await proc.stderr.text();
+
+    if (format === "json") {
+      if (exitCode === 0 || exitCode === 1) {
+        // 0: all up-to-date, 1: some outdated
+        try {
+          const data = out.trim() ? JSON.parse(out) : {};
+          // use relative path as key
+          const rel = dir === rootPath ? "." : dir.slice(rootPath.length + 1);
+          results[rel] = data;
+        } catch (e) {
+          error(`❌ JSON parse error in ${dir}:`, e.message);
+          failures++;
+        }
+      } else {
+        error(`❌ bun outdated failed in ${dir} (exit ${exitCode})`);
+        if (err) error(err.trim());
+        failures++;
+      }
+    } else {
+      // text mode: print stdout & stderr
+      if (exitCode === 0) {
+        log("   ✔ up-to-date");
+      } else if (exitCode === 1) {
+        log(out.trim() || "(no outdated packages found)");
+      } else {
+        error(`❌ bun outdated error in ${dir} (exit ${exitCode})`);
+        if (err) error(err.trim());
+        failures++;
+      }
+    }
   }
 
-  const pkgSet = new Set();
-  for (const path of pkgPaths) {
-    const json = await readJson(path);
-    for (const dep of Object.keys(json.dependencies || {})) pkgSet.add(dep);
-    for (const dep of Object.keys(json.devDependencies || {})) pkgSet.add(dep);
+  // ─── OUTPUT & EXIT ───────────────────────────────────────────────────────────
+  if (format === "json" && !dryRun) {
+    console.log(JSON.stringify(results, null, 2));
   }
 
-  if (pkgSet.size === 0) {
-    if (strict) error("No dependencies to check.");
-    else { warn("No dependencies to check."); Bun.exit(0); }
-  }
-
-  const updates = await checkPackageUpdates([...pkgSet], daysBack);
-
-  if (dryRun) {
-    if (format === "json") console.log(JSON.stringify(updates, null, 2));
-    else updates.forEach(u => console.log(`- ${u.package}@${u.version} published on ${u.published}`));
-    return;
-  }
-
-  if (updates.length === 0) {
-    success(`No recent updates in the last ${daysBack} days.`);
-    return;
-  }
-
-  if (format === "json") {
-    console.log(JSON.stringify(updates, null, 2));
+  if (failures > 0) {
+    error(`\n❌ check-updates: completed with ${failures} errors/outdated`);
+    Bun.exit(1);
   } else {
-    console.log(`Recent updates within ${daysBack} days:`);
-    updates.forEach(u =>
-      console.log(`- ${u.package}@${u.version} published on ${u.published}`)
-    );
+    log(`\n✔ check-updates: all done`);
   }
-
-  success(`Checked ${pkgSet.size} packages.`);
 }
 
-main().catch(e => error(e.message || String(e)));
+main().catch(err => {
+  console.error("‼ check-updates crashed:", err);
+  Bun.exit(1);
+});

@@ -1,230 +1,298 @@
+#!/usr/bin/env bun
+
 /**
- * codemods/transform-websockets.js
+ * scripts/transform-websockets.js
  *
- * Convert Socket.IO + app.listen → @elysia/ws + Bun.serve
- *
- * Usage:
- *   jscodeshift -t codemods/transform-websockets.js "<globs>"
+ * A Bun-native CLI that migrates Socket.IO → Elysia WS + Elysia.listen:
+ *  • Idempotent via "// bun: websockets-updated" marker
+ *  • Removes CJS require()/ESM import of 'socket.io' & 'http'
+ *  • Inserts `import { ws } from '@elysia/ws'`
+ *  • Detects all `const app = new Elysia(...)` bindings
+ *  • Injects `app.use(ws())` after logger/otel or immediately after instantiation
+ *  • Converts `io.on(...)` and `io.of(...).on(...)` → `app.ws(path, { open(ws){…} })`
+ *  • Renames `socket.emit` → `ws.send` in handler bodies
+ *  • Rewrites `app.listen(port[,host])` → `await app.listen(port, { hostname: host })`
+ *  • CLI flags: --quiet, --dry-run
+ *  • Uses Bun.Glob & Bun.file/Bun.write for I/O
  */
 
-export default function transformer(fileInfo, { jscodeshift: j }) {
-  const root = j(fileInfo.source);
+import { Glob } from 'bun'
+import jscodeshift from 'jscodeshift'
 
-  //
-  // 1) Gather any socket.io Server names from imports or requires
-  //
-  const socketServerNames = new Set();
+const args   = Bun.argv.slice(1)
+const dryRun = args.includes('--dry-run') || args.includes('-d')
+const quiet  = args.includes('--quiet')   || args.includes('-q')
+const log    = (...m) => !quiet && console.log(...m)
+const debug  = (...m) => console.debug('[transform-websockets]', ...m)
 
-  // import Server from 'socket.io'
-  root.find(j.ImportDeclaration, { source: { value: 'socket.io' } })
-    .forEach(path => {
-      path.node.specifiers.forEach(spec => {
-        if (spec.imported?.name === 'Server') {
-          socketServerNames.add(spec.local.name);
-        } else if (spec.type === 'ImportDefaultSpecifier') {
-          socketServerNames.add(spec.local.name);
-        }
-      });
-      j(path).remove();
-    });
+// Helpers
 
-  // const { Server } = require('socket.io')  OR  const io = require('socket.io')
-  root.find(j.VariableDeclaration)
-    .filter(path => {
-      const dec = path.node.declarations[0];
-      return dec.init?.callee?.name === 'require'
-          && dec.init.arguments?.[0].value === 'socket.io';
-    })
-    .forEach(path => {
-      const dec = path.node.declarations[0];
-      if (dec.id.type === 'ObjectPattern') {
-        dec.id.properties.forEach(p => {
-          if (p.key.name === 'Server') socketServerNames.add(p.value.name);
-        });
-      } else if (dec.id.type === 'Identifier') {
-        socketServerNames.add(dec.id.name);
-      }
-      j(path).remove();
-    });
-
-  if (!socketServerNames.size) {
-    // nothing to do
-    return null;
-  }
-
-  //
-  // 2) Remove any `import http from 'http'` + `http.createServer(...)`
-  //
-  root.find(j.ImportDeclaration, { source: { value: 'http' } }).remove();
-  root.find(j.CallExpression, {
-    callee: {
-      object: { name: 'http' },
-      property: { name: 'createServer' }
-    }
-  }).forEach(path => j(path.parentPath).remove());
-
-  //
-  // 3) Inject `import { ws } from '@elysia/ws'` if missing
-  //
-  if (!root.find(j.ImportDeclaration, { source: { value: '@elysia/ws' } }).size()) {
-    const imp = j.importDeclaration(
-      [ j.importSpecifier(j.identifier('ws')) ],
-      j.literal('@elysia/ws')
-    );
-    root.get().node.program.body.unshift(imp);
-  }
-
-  //
-  // 4) Locate your Elysia app variable (e.g. `const app = new Elysia()`)
-  //
-  let appName = 'app';
-  root.find(j.NewExpression, { callee: { name: 'Elysia' } })
-    .forEach(path => {
-      const parent = path.parentPath.node;
-      if (parent.type === 'VariableDeclarator' && parent.id.type === 'Identifier') {
-        appName = parent.id.name;
-      }
-    });
-
-  //
-  // 5) Insert `app.use(ws())` right after `new Elysia()`
-  //
-  const useWs = j.expressionStatement(
-    j.callExpression(
-      j.memberExpression(j.identifier(appName), j.identifier('use')),
-      [ j.callExpression(j.identifier('ws'), []) ]
+/** Insert import if missing */
+function addImport(root, j, specifiers, source) {
+  if (!root.find(j.ImportDeclaration, { source:{ value: source } }).size()) {
+    root.get().node.program.body.unshift(
+      j.importDeclaration(specifiers, j.literal(source))
     )
-  );
-  root.find(j.VariableDeclarator, {
-    id: { name: appName },
-    init: { type: 'NewExpression', callee: { name: 'Elysia' } }
-  }).forEach(path => {
-    // insert after the entire `const app = new Elysia(...);` statement
-    path.parentPath.parent.insertAfter(useWs);
-  });
+    debug(`import '${source}'`)
+    return true
+  }
+  return false
+}
 
-  //
-  // 6) Remove any `new Server(...)` (Socket.IO server instantiation)
-  //
-  const ioNames = new Set();
-  socketServerNames.forEach(name => {
-    root.find(j.NewExpression, { callee: { name } })
-      .forEach(path => {
-        const varName = path.parentPath.node.id?.name;
-        if (varName) ioNames.add(varName);
-        j(path.parentPath).remove();
-      });
-  });
+/** Remove Node-style require */
+function removeRequire(root, j, mod) {
+  const decls = root.find(j.VariableDeclarator, {
+    init: { callee:{ name:'require', arguments:[{ value:mod }] } }
+  })
+  if (decls.size()) { decls.remove(); debug(`removed require('${mod}')`); return true }
+  return false
+}
 
-  //
-  // 7) Transform each `io.on('connection', socket => { … })`
-  //    into `app.ws('/socket.io', { open: socket => { … } })`
-  //
-  ioNames.forEach(ioName => {
-    root.find(j.CallExpression, {
-      callee: {
-        object: { name: ioName },
-        property: { name: 'on' }
+/** Remove ESM import */
+function removeImport(root, j, mod) {
+  const imps = root.find(j.ImportDeclaration, { source:{ value:mod } })
+  if (imps.size()) { imps.remove(); debug(`removed import '${mod}'`); return true }
+  return false
+}
+
+/** Find import alias for a given export from a module */
+function findAlias(root, j, moduleName, exportName) {
+  let alias = null
+  root.find(j.ImportDeclaration, { source:{ value: moduleName } }).forEach(path => {
+    for (const spec of path.node.specifiers) {
+      if ((spec.type === 'ImportDefaultSpecifier' && exportName === 'default') ||
+          (spec.type === 'ImportSpecifier' && spec.imported.name === exportName)) {
+        alias = spec.local.name
       }
-    })
-    .filter(path => {
-      const [evt, handler] = path.node.arguments;
-      return evt.value === 'connection'
-          && (handler.type === 'ArrowFunctionExpression' || handler.type === 'FunctionExpression');
-    })
-    .forEach(path => {
-      const [, handler] = path.node.arguments;
-      const sockParam = handler.params[0] || j.identifier('socket');
-      const body = handler.body;
+    }
+  })
+  return alias
+}
 
-      // rewrite socket.emit(...) → socket.send(...)
-      j(body)
-        .find(j.CallExpression, {
-          callee: {
-            object: { name: sockParam.name },
-            property: { name: 'emit' }
-          }
+/** Locate all Elysia apps: const X = new Elysia(...) or Elysia(...) */
+function findApps(root, j, eAlias) {
+  const apps = []
+  root.find(j.VariableDeclarator).forEach(path => {
+    const { id, init } = path.node
+    if (id.type !== 'Identifier' || !init) return
+    const calleeName = init.type === 'NewExpression'
+      ? init.callee.name
+      : init.type === 'CallExpression'
+        ? init.callee.name
+        : null
+    if (calleeName === eAlias) apps.push({ varName: id.name, path })
+  })
+  return apps
+}
+
+/** Build nullish fallback: a ?? Bun.env.X ?? fallback */
+function nullish(j, left, envVar, fallback) {
+  return j.logicalExpression(
+    '??',
+    left,
+    j.logicalExpression(
+      '??',
+      j.memberExpression(j.memberExpression(j.identifier('Bun'), j.identifier('env')), j.identifier(envVar)),
+      j.literal(fallback)
+    )
+  )
+}
+
+// Transformer
+
+function transformer(source, filePath) {
+  if (source.includes('// bun: websockets-updated')) return null
+
+  const j = jscodeshift
+  const root = j(source)
+  let did = false
+
+  debug('processing', filePath)
+
+  // 1) Idempotency marker
+  root.get().node.program.body.unshift(
+    j.expressionStatement(j.literal('// bun: websockets-updated'))
+  )
+  did = true
+
+  // 2) Remove socket.io & http
+  did ||= removeRequire(root, j, 'socket.io')
+  did ||= removeImport(root, j, 'socket.io')
+  did ||= removeRequire(root, j, 'http')
+  did ||= removeImport(root, j, 'http')
+
+  // 3) Insert ESM import for WS plugin
+  if (addImport(root, j, [ j.importSpecifier(j.identifier('ws')) ], '@elysia/ws')) {
+    did = true
+  }
+
+  // 4) Find Elysia alias & apps
+  const eAlias = findAlias(root, j, 'elysia', 'Elysia')
+  if (!eAlias) {
+    debug(`no Elysia import in ${filePath}`)
+    return did ? root.toSource({ quote: 'single', trailingComma: true }) : null
+  }
+  const apps = findApps(root, j, eAlias)
+  if (!apps.length) {
+    debug(`no app binding in ${filePath}`)
+    return did ? root.toSource({ quote: 'single', trailingComma: true }) : null
+  }
+
+  // 5) Find ordering anchors
+  const loggerAlias    = findAlias(root, j, '@elysia/logger', 'logger')
+  const telemetryAlias = findAlias(root, j, '@elysia/opentelemetry', 'opentelemetry')
+
+  // 6) Inject app.use(ws()) on each app
+  apps.forEach(({ varName, path }) => {
+    let anchor = path
+
+    // after logger()
+    if (loggerAlias) {
+      const logCall = root.find(j.CallExpression, {
+        callee: { object:{ name:varName }, property:{ name:'use' }}
+      }).filter(p => p.node.arguments[0]?.callee?.name === loggerAlias).at(0)
+      if (logCall.size()) anchor = logCall.get()
+    }
+    // else after telemetry()
+    if (telemetryAlias && anchor === path) {
+      const telCall = root.find(j.CallExpression, {
+        callee: { object:{ name:varName }, property:{ name:'use' }}
+      }).filter(p => p.node.arguments[0]?.callee?.name === telemetryAlias).at(0)
+      if (telCall.size()) anchor = telCall.get()
+    }
+
+    const stmt = j.expressionStatement(
+      j.callExpression(
+        j.memberExpression(j.identifier(varName), j.identifier('use')),
+        [ j.callExpression(j.identifier('ws'), []) ]
+      )
+    )
+    j(anchor).parent.insertAfter(stmt)
+    debug(`injected app.use(ws()) for ${varName}`)
+    did = true
+  })
+
+  // 7) Transform Socket.IO connection handlers
+  let ioAlias = null
+  const serverAlias = findAlias(root, j, 'socket.io', 'Server')
+  if (serverAlias) {
+    root.find(j.VariableDeclarator, {
+      init: { callee: { name: serverAlias } }
+    }).forEach(p => {
+      ioAlias = p.node.id.name
+      debug(`found io alias: ${ioAlias}`)
+    })
+  }
+
+  if (ioAlias) {
+    apps.forEach(({ varName }) => {
+      root.find(j.CallExpression, { callee:{ property:{ name:'on' }}}).forEach(p => {
+        const callee = p.node.callee
+        let namespace = '/'
+        let handler   = p.node.arguments[1]
+
+        // io.of('/chat').on('connection', handler)
+        if (
+          callee.object.type === 'MemberExpression' &&
+          callee.object.object.name === ioAlias &&
+          callee.object.property.name === 'of' &&
+          p.node.arguments[0].value === 'connection'
+        ) {
+          namespace = p.node.arguments[0].value
+        }
+        // io.on('connection', handler)
+        else if (!(callee.object.name === ioAlias && p.node.arguments[0].value === 'connection')) {
+          return
+        }
+
+        // rewrite socket.emit → ws.send
+        const oldParam = handler.params[0]?.name || 'socket'
+        const wsParam  = 'ws'
+        j(handler.body).find(j.CallExpression, {
+          callee:{ object:{ name:oldParam }, property:{ name:'emit' }}
+        }).forEach(q => {
+          q.node.callee = j.memberExpression(j.identifier(wsParam), j.identifier('send'))
         })
-        .forEach(p => p.node.callee.property.name = 'send');
 
-      // build ws options: only `open`
-      const wsOpts = j.objectExpression([
-        j.property(
+        // build app.ws(namespace, { open(ws){…} })
+        const openProp = j.property(
           'init',
           j.identifier('open'),
-          j.functionExpression(
-            null,
-            [ sockParam ],
-            body.type === 'BlockStatement'
-              ? body
-              : j.blockStatement([ j.returnStatement(body) ])
+          j.functionExpression(null, [ j.identifier(wsParam) ], handler.body)
+        )
+        const wsStmt = j.expressionStatement(
+          j.callExpression(
+            j.memberExpression(j.identifier(varName), j.identifier('ws')),
+            [ j.literal(namespace), j.objectExpression([ openProp ]) ]
           )
         )
-      ]);
 
-      // insert `app.ws('/socket.io', { open: … })` right after our `app.use(ws())`
-      const wsCall = j.expressionStatement(
+        // insert after the ws middleware
+        const wsUse = root.find(j.CallExpression, {
+          callee:{ object:{ name:varName }, property:{ name:'use' }}
+        }).filter(r => r.node.arguments[0]?.callee?.name === 'ws').at(-1).get()
+        j(wsUse).parent.insertAfter(wsStmt)
+
+        // remove original io.on/namespace.on(...)
+        j(p.parent).remove()
+        debug(`mapped namespace '${namespace}'`)
+        did = true
+      })
+    })
+  }
+
+  // 8) Rewrite app.listen → await app.listen(port, { hostname })
+  apps.forEach(({ varName }) => {
+    root.find(j.CallExpression, {
+      callee:{ object:{ name:varName }, property:{ name:'listen' }}
+    }).forEach(p => {
+      const [portArg, hostArg] = p.node.arguments
+      const portExpr = nullish(j, portArg || j.literal(undefined), 'PORT', 3000)
+      const hostExpr = nullish(j, hostArg || j.literal(undefined), 'HOST', '0.0.0.0')
+
+      const awaitExpr = j.awaitExpression(
         j.callExpression(
-          j.memberExpression(j.identifier(appName), j.identifier('ws')),
-          [ j.literal('/socket.io'), wsOpts ]
+          j.memberExpression(j.identifier(varName), j.identifier('listen')),
+          [ portExpr, j.objectExpression([
+              j.property('init', j.identifier('hostname'), hostExpr)
+            ]) ]
         )
-      );
-      root.find(j.ExpressionStatement, stmt => stmt === useWs)
-          .forEach(p => p.insertAfter(wsCall));
+      )
+      j(p.parent).replaceWith(j.expressionStatement(awaitExpr))
+      debug(`rewrote ${varName}.listen → await ${varName}.listen(...)`)
+      did = true
+    })
+  })
 
-      // remove original io.on(...)
-      j(path).remove();
-    });
-  });
-
-  //
-  // 8) Replace final `app.listen(port)` with `Bun.serve({ fetch: app.handle, websocket:{}, port })`
-  //
-  root.find(j.CallExpression, {
-    callee: {
-      object: { name: appName },
-      property: { name: 'listen' }
-    }
-  }).forEach(path => {
-    const args = path.node.arguments;
-    // derive port: use first argument or fallback to Bun.env.PORT || 3000
-    let portExpr;
-    if (args[0]) {
-      portExpr = args[0];
-    } else {
-      portExpr = j.logicalExpression(
-        '||',
-        j.memberExpression(
-          j.memberExpression(j.identifier('Bun'), j.identifier('env')),
-          j.identifier('PORT')
-        ),
-        j.literal(3000)
-      );
-    }
-
-    // build Bun.serve({ fetch: app.handle, websocket: {}, port: <expr> })
-    const serveCall = j.callExpression(
-      j.memberExpression(j.identifier('Bun'), j.identifier('serve')),
-      [ j.objectExpression([
-          j.property('init', j.identifier('fetch'),
-            j.memberExpression(j.identifier(appName), j.identifier('handle'))
-          ),
-          j.property('init', j.identifier('websocket'),
-            j.objectExpression([])
-          ),
-          j.property('init', j.identifier('port'),
-            portExpr
-          )
-        ])
-      ]
-    );
-
-    // replace the whole `app.listen(...)` expression statement
-    j(path.parentPath).replaceWith(j.expressionStatement(serveCall));
-  });
-
-  //
-  // Done
-  //
-  return root.toSource({ quote: 'single' });
+  return did
+    ? root.toSource({ quote:'single', trailingComma:true })
+    : null
 }
+
+// Runner
+
+async function main() {
+  for await (const filePath of new Glob(['**/*.js','**/*.ts'])) {
+    if (filePath.includes('node_modules/') || filePath.endsWith('transform-websockets.js')) continue
+
+    let src
+    try { src = await Bun.file(filePath).text() }
+    catch (e) { log(`read failed: ${filePath}`, e.message); continue }
+
+    let out
+    try { out = transformer(src, filePath) }
+    catch (e) { console.error('[transform-websockets] error in', filePath, e); continue }
+
+    if (!out) { debug(`no changes: ${filePath}`); continue }
+    if (!dryRun) {
+      try { await Bun.write(filePath, out) }
+      catch (e) { log(`write failed: ${filePath}`, e.message) }
+    }
+    log(`${dryRun ? 'DRY' : '✔'} ${filePath}`)
+  }
+}
+
+main().catch(e => {
+  console.error('[transform-websockets] fatal:', e)
+  Bun.exit(1)
+})

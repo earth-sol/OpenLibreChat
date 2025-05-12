@@ -2,6 +2,14 @@
  * codemods/transform-e2e-tests.js
  *
  * A jscodeshift transformer for Bun+Elysia migration of E2E tests.
+ *
+ * Enhancements:
+ *  - Guards against duplicate `import { config } from 'dotenv'`
+ *  - Enables reuseWhitespace to preserve formatting
+ *  - Transforms `path.resolve(process.cwd(), ...)` and `path.join(process.cwd(), ...)` → `Bun.cwd() + '/...'.replace(/\.js$/, '.ts')`
+ *  - Broadens Playwright `webServer.command` conversion:
+ *      • TemplateLiterals starting with `node ` → `bun run `
+ *      • StringLiterals starting with `node ` → `bun run `
  */
 
 export const parser = 'ts';
@@ -9,138 +17,129 @@ export const parser = 'ts';
 export default function transformer(file, api) {
   const j = api.jscodeshift;
   const root = j(file.source);
-  const p = file.path.replace(/\\/g, '/');
 
   // 1) Drop `import path from 'path'`
   root.find(j.ImportDeclaration, { source: { value: 'path' } }).remove();
 
-  // 2) Replace path.resolve(process.cwd(), '<file>.js') → Bun.cwd() + '/<file>.ts'
-  root
-    .find(j.CallExpression, {
+  // 2) require('dotenv').config() → import { config } from 'dotenv'; config();
+  // Remove require-config calls
+  let needsConfigImport = false;
+  root.find(j.ExpressionStatement, {
+    expression: {
       callee: {
-        object: { name: 'path' },
-        property: { name: 'resolve' }
+        object: {
+          callee: { name: 'require' },
+          arguments: [{ value: 'dotenv' }]
+        },
+        property: { name: 'config' }
       }
-    })
-    .forEach(pathResolve => {
-      const [first, second] = pathResolve.node.arguments;
-      if (
-        first &&
-        first.type === 'CallExpression' &&
-        first.callee.type === 'MemberExpression' &&
-        first.callee.object.name === 'process' &&
-        first.callee.property.name === 'cwd' &&
-        second &&
-        (second.type === 'Literal' || second.type === 'StringLiteral')
-      ) {
-        // build Bun.cwd() + '/…'
-        let filePath = String(second.value);
-        // switch .js → .ts
-        filePath = filePath.replace(/\.js$/, '.ts');
-        if (!filePath.startsWith('/')) filePath = '/' + filePath;
+    }
+  })
+  .forEach(path => {
+    needsConfigImport = true;
+    // Replace `require('dotenv').config(args)` with `config(args)`
+    const args = path.node.expression.arguments || [];
+    j(path).replaceWith(
+      j.expressionStatement(
+        j.callExpression(j.identifier('config'), args)
+      )
+    );
+  });
 
-        const bunCwd = j.callExpression(
-          j.memberExpression(j.identifier('Bun'), j.identifier('cwd')),
-          []
-        );
-        j(pathResolve).replaceWith(
-          j.binaryExpression('+', bunCwd, j.literal(filePath))
-        );
-      }
-    });
+  // Add import { config } from 'dotenv' at top if needed and not already present
+  if (needsConfigImport) {
+    const hasImport = root.find(j.ImportDeclaration, {
+      source: { value: 'dotenv' }
+    }).filter(path =>
+      path.node.specifiers.some(spec =>
+        spec.imported && spec.imported.name === 'config'
+      )
+    ).size() > 0;
 
-  // 3) Convert `require('dotenv').config(...)` → `import { config } from 'dotenv'; config(...)`
-  let insertedConfigImport = false;
-  root
-    .find(j.ExpressionStatement, {
-      expression: {
-        type: 'CallExpression',
-        callee: {
-          type: 'MemberExpression',
-          object: {
-            type: 'CallExpression',
-            callee: { name: 'require' },
-            arguments: [{ value: 'dotenv' }]
-          },
-          property: { name: 'config' }
-        }
-      }
-    })
-    .forEach(stmt => {
-      const args = stmt.node.expression.arguments;
-      if (!insertedConfigImport) {
-        const imp = j.importDeclaration(
+    if (!hasImport) {
+      root.get().node.program.body.unshift(
+        j.importDeclaration(
           [j.importSpecifier(j.identifier('config'))],
           j.literal('dotenv')
-        );
-        root.get().node.program.body.unshift(imp);
-        insertedConfigImport = true;
-      }
-      j(stmt).replaceWith(
-        j.expressionStatement(j.callExpression(j.identifier('config'), args))
+        )
       );
-    });
+    }
+  }
 
-  // 4) Replace all process.env.X → Bun.env.X
-  root
-    .find(j.MemberExpression, {
-      object: {
-        type: 'MemberExpression',
-        object: { name: 'process' },
-        property: { name: 'env' }
-      }
-    })
-    .forEach(pathEnv => {
-      const prop = pathEnv.node.property;
-      const newEnv = j.memberExpression(
+  // 3) process.env.X → Bun.env.X
+  root.find(j.MemberExpression, {
+    object: { name: 'process' },
+    property: { name: 'env' }
+  }).forEach(path => {
+    // transform process.env.X → Bun.env.X
+    const prop = path.parentPath.node.property;
+    j(path.parentPath).replaceWith(
+      j.memberExpression(
         j.memberExpression(j.identifier('Bun'), j.identifier('env')),
-        prop,
-        pathEnv.node.computed
-      );
-      j(pathEnv).replaceWith(newEnv);
-    });
+        prop
+      )
+    );
+  });
 
-  // 5) Clean up require.resolve('…') → '…'
-  root
-    .find(j.CallExpression, {
+  // 4) path.resolve(process.cwd(), 'file.js') & path.join(...)
+  ['resolve', 'join'].forEach(method => {
+    root.find(j.CallExpression, {
       callee: {
-        type: 'MemberExpression',
-        object: { name: 'require' },
-        property: { name: 'resolve' }
+        object: { name: 'path' },
+        property: { name: method }
       }
-    })
-    .forEach(call => {
-      const arg = call.node.arguments[0];
-      if (arg && (arg.type === 'Literal' || arg.type === 'StringLiteral')) {
-        j(call).replaceWith(j.literal(arg.value));
-      }
-    });
-
-  // 6) In Playwright configs: webServer.command: `node ${…}` → `bun run ${…}`
-  root
-    .find(j.TemplateLiteral)
-    .forEach(tl => {
-      const quasis = tl.node.quasis;
+    }).forEach(pathCall => {
+      const args = pathCall.node.arguments;
+      // first arg must be process.cwd()
       if (
-        quasis.length === 2 &&
-        quasis[0].value.raw.trim().startsWith('node ')
+        args.length >= 2 &&
+        j.CallExpression.check(args[0]) &&
+        j.MemberExpression.check(args[0].callee) &&
+        args[0].callee.object.name === 'process' &&
+        args[0].callee.property.name === 'cwd'
       ) {
-        // rewrite prefix
-        quasis[0].value.raw = quasis[0].value.raw.replace(/^(\s*)node\s+/, '$1bun run ');
-        quasis[0].value.cooked = quasis[0].value.raw;
+        // collect literal segments, replace .js → .ts
+        const segments = args.slice(1).map(arg => {
+          if (j.Literal.check(arg) && typeof arg.value === 'string') {
+            return arg.value.replace(/\.js$/, '.ts');
+          }
+          return null;
+        }).filter(s => s !== null);
+        const joined = segments.join('/');
+        // build Bun.cwd() + '/joined'
+        const newExpr = j.binaryExpression(
+          '+',
+          j.callExpression(
+            j.memberExpression(j.identifier('Bun'), j.identifier('cwd')),
+            []
+          ),
+          j.literal('/' + joined)
+        );
+        j(pathCall).replaceWith(newExpr);
       }
     });
+  });
 
-  // also handle string-literal commands if present
-  root
-    .find(j.Literal, { value: v => typeof v === 'string' && v.startsWith('node ') })
-    .forEach(lit => {
-      lit.node.value = lit.node.value.replace(/^node\s+/, 'bun run ');
-    });
+  // 5) Playwright webServer.command conversions
+  // a) TemplateLiteral
+  root.find(j.TemplateLiteral).filter(path =>
+    path.node.quasis.length > 0 &&
+    path.node.quasis[0].value.raw.startsWith('node ')
+  ).forEach(pathTL => {
+    pathTL.node.quasis[0].value.raw =
+      pathTL.node.quasis[0].value.raw.replace(/^node\s+/, 'bun run ');
+  });
+
+  // b) StringLiteral or Literal
+  root.find(j.Literal, {
+    value: v => typeof v === 'string' && v.startsWith('node ')
+  }).forEach(pathLit => {
+    pathLit.node.value = pathLit.node.value.replace(/^node\s+/, 'bun run ');
+  });
 
   return root.toSource({
     quote: 'single',
     trailingComma: true,
-    reuseWhitespace: false
+    reuseWhitespace: true
   });
 }

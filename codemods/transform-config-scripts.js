@@ -1,264 +1,285 @@
+#!/usr/bin/env bun
+
 /**
- * codemods/transform-config-scripts.js
+ * transform-config-scripts.js
  *
- * - CJS → ESM imports
- * - process.env.X → Bun.env.X
- * - fs.promises.readFile/writeFile → Bun.file(...).text() / Bun.write(...)
- * - fs.readFileSync/writeFileSync → await Bun.file(...).text() / Bun.write(...)
- *   (marks enclosing fn async if needed)
- * - child_process.execSync(...) → Bun.spawnSync(['sh','-c', ...], opts)
- *
- * Usage:
- *   jscodeshift -t codemods/transform-config-scripts.js "config/\*\*\/\*.{js,ts}" --parser=tsx --extensions=js,ts
+ * - Scans all JS/TS under config/
+ * - Uses Bun.Glob + Bun.file()/Bun.write() for discovery & I/O
+ * - Imports jscodeshift *only* for AST transforms
+ * - Converts:
+ *    • require → import
+ *    • process.env → Bun.env
+ *    • fs.*Sync / fs.promises → Bun.file().text() / Bun.write()
+ *    • child_process.execSync → Bun.spawnSync
+ * - Marks functions async when introducing await
+ * - Verbose by default; --quiet to silence; --dry-run to preview
  */
-export default function transformer(file, api) {
-  const j = api.jscodeshift;
-  const root = j(file.source);
 
-  // Helpers
-  const imported = new Set();
-  const newImports = [];
-  const fsVars = new Set();       // local names for require('fs')
-  const cpVars = new Set();       // local names for require('child_process')
-  const cpExecs = new Set();      // local names for destructured execSync
+import { Glob } from "bun";
+import path from "path";
+import jscodeshift from "jscodeshift";
 
-  function toId(name) {
-    return name.replace(/[^a-zA-Z0-9]+(.)/g, (_, c) => c.toUpperCase()).replace(/^[^a-zA-Z]+/, '');
-  }
+// CLI flags
+const args   = Bun.argv.slice(1);
+const dryRun = args.includes("--dry")    || args.includes("--dry-run");
+const quiet  = args.includes("--quiet")  || args.includes("--silent");
+const help   = args.includes("-h")       || args.includes("--help");
+if (help) {
+  console.log(`
+Usage: transform-config-scripts.js [options]
 
+Options:
+  --dry-run, --dry      Preview changes without writing
+  --quiet, --silent     Suppress logs
+  -h, --help            Show help
+`);
+  Bun.exit(0);
+}
+const log   = (...m) => { if (!quiet) console.log(...m) };
+const error = (...m) => console.error(...m);
+
+/**
+ * Perform the AST transforms on a single file's source.
+ */
+function transformSource(source) {
+  const j = jscodeshift;
+  const root = j(source);
+
+  // Utility to mark containing function async
   function ensureAsync(path) {
-    let p = path;
-    while (p && !(
-      j.FunctionDeclaration.check(p.node) ||
-      j.FunctionExpression.check(p.node) ||
-      j.ArrowFunctionExpression.check(p.node)
-    )) p = p.parentPath;
-    if (p && !p.node.async) p.node.async = true;
+    const fn = path.getFunctionParent();
+    if (fn && !fn.node.async) fn.node.async = true;
   }
 
-  // 1. Collect fs & child_process require() locals
-  root.find(j.VariableDeclarator, {
-    init: { type: 'CallExpression', callee: { name: 'require' }, arguments: [{ value: 'fs' }] }
-  }).forEach(p => {
-    if (j.Identifier.check(p.node.id)) {
-      fsVars.add(p.node.id.name);
-    } else if (j.ObjectPattern.check(p.node.id)) {
-      p.node.id.properties.forEach(prop => {
-        if (j.Property.check(prop) && j.Identifier.check(prop.value)) {
-          fsVars.add(prop.value.name);
-        }
-      });
-    }
-  });
+  // 1) require(...) → import
+  root.find(j.CallExpression, { callee: { name: "require" } })
+    .forEach(p => {
+      const [arg] = p.node.arguments;
+      if (!j.Literal.check(arg)) return;
+      const src = arg.value;
+      const parent = p.parentPath;
+      // const x = require('y')
+      if (parent.node.type === "VariableDeclarator") {
+        const id = parent.node.id;
+        const importDec = j.importDeclaration(
+          [j.importDefaultSpecifier(id)],
+          j.literal(src)
+        );
+        parent.parentPath.replace(importDec);
+      }
+      // require('x');
+      else if (parent.node.type === "ExpressionStatement") {
+        const importDec = j.importDeclaration([], j.literal(src));
+        parent.replace(importDec);
+      }
+      // dynamic require → await import(...)
+      else {
+        const imp = j.awaitExpression(
+          j.callExpression(j.import(), [arg])
+        );
+        ensureAsync(p);
+        p.replace(imp);
+      }
+    });
 
-  root.find(j.VariableDeclarator, {
-    init: { type: 'CallExpression', callee: { name: 'require' }, arguments: [{ value: 'child_process' }] }
-  }).forEach(p => {
-    const id = p.node.id;
-    if (j.Identifier.check(id)) {
-      cpVars.add(id.name);
-    } else if (j.ObjectPattern.check(id)) {
-      id.properties.forEach(prop => {
-        if (j.Property.check(prop) && prop.key.name === 'execSync' && j.Identifier.check(prop.value)) {
-          cpExecs.add(prop.value.name);
-        }
-      });
-    }
-  });
-
-  // 2. Transform `const X = require('mod')` → `import X from 'mod'`
-  root.find(j.VariableDeclarator, {
-    init: { type: 'CallExpression', callee: { name: 'require' }, arguments: [{ type: 'Literal' }] }
-  }).forEach(path => {
-    const decl = path.node;
-    const mod = decl.init.arguments[0].value;
-    if (imported.has(mod)) return;
-    const specs = [];
-    if (j.Identifier.check(decl.id)) {
-      specs.push(j.importDefaultSpecifier(j.identifier(decl.id.name)));
-    } else if (j.ObjectPattern.check(decl.id)) {
-      decl.id.properties.forEach(prop => {
-        if (j.Property.check(prop) && j.Identifier.check(prop.key)) {
-          const name = prop.key.name;
-          const alias = prop.value.name;
-          specs.push(name === alias
-            ? j.importSpecifier(j.identifier(name))
-            : j.importSpecifier(j.identifier(name), j.identifier(alias))
-          );
-        }
-      });
-    }
-    if (specs.length) {
-      newImports.push(j.importDeclaration(specs, j.literal(mod)));
-      imported.add(mod);
-    }
-  });
-
-  // 3. Transform dynamic require('module-alias')(…) → import + call
-  root.find(j.ExpressionStatement, {
-    expression: {
-      type: 'CallExpression',
-      callee: { type: 'CallExpression', callee: { name: 'require' }, arguments: [{ type: 'Literal' }] }
-    }
-  }).forEach(path => {
-    const outer = path.node.expression;
-    const inner = outer.callee;
-    const mod = inner.arguments[0].value;
-    const id = toId(mod);
-    if (!imported.has(mod)) {
-      newImports.push(j.importDeclaration(
-        [j.importDefaultSpecifier(j.identifier(id))],
-        j.literal(mod)
-      ));
-      imported.add(mod);
-    }
-    path.replace(
-      j.expressionStatement(
-        j.callExpression(j.identifier(id), outer.arguments)
-      )
-    );
-  });
-
-  // 4. Remove all original require() decls
-  root.find(j.VariableDeclarator, {
-    init: { type: 'CallExpression', callee: { name: 'require' } }
-  }).forEach(path => {
-    const p = path.parent.node;
-    if (p.declarations.length === 1) j(path.parent).remove();
-    else j(path).remove();
-  });
-
-  // 5. Insert our new imports at the top
-  if (newImports.length) {
-    const first = root.find(j.ImportDeclaration).at(0);
-    if (first.size()) first.insertBefore(newImports);
-    else root.get().node.program.body = [...newImports, ...root.get().node.program.body];
-  }
-
-  // 6. process.env.X → Bun.env.X
+  // 2) process.env.X & import.meta.env.X → Bun.env.X
   root.find(j.MemberExpression, {
-    object: { object: { name: 'process' }, property: { name: 'env' } }
+    object: {
+      object: { name: "process", type: "Identifier" },
+      property: { name: "env", type: "Identifier" }
+    }
   }).replaceWith(p =>
     j.memberExpression(
-      j.memberExpression(j.identifier('Bun'), j.identifier('env')),
-      p.node.property,
-      p.node.computed
+      j.memberExpression(j.identifier("Bun"), j.identifier("env")),
+      p.node.property
+    )
+  );
+  root.find(j.MemberExpression, {
+    object: {
+      object: {
+        object: { name: "import", type: "Identifier" },
+        property: { name: "meta", type: "Identifier" }
+      },
+      property: { name: "env", type: "Identifier" }
+    }
+  }).replaceWith(p =>
+    j.memberExpression(
+      j.memberExpression(j.identifier("Bun"), j.identifier("env")),
+      p.node.property
     )
   );
 
-  // 7. child_process.execSync(...) → Bun.spawnSync(['sh','-c', ...], opts)
+  // 3) fs.readFileSync → await Bun.file().text()
   root.find(j.CallExpression, {
-    callee: path => (
-      (path.type === 'MemberExpression'
-        && cpVars.has(path.object.name)
-        && path.property.name === 'execSync')
-      || (path.type === 'Identifier' && cpExecs.has(path.name))
-    )
-  }).replaceWith(path => {
-    const call = path.node;
-    const cmd = call.arguments[0];
-    const opts = call.arguments[1] || j.objectExpression([]);
-    // if string, wrap in shell array
-    const argsArray = j.isLiteral(cmd) && typeof cmd.value === 'string'
-      ? j.arrayExpression([
-          j.literal('sh'),
-          j.literal('-c'),
-          j.literal(cmd.value)
-        ])
-      : cmd;
-    return j.callExpression(
-      j.memberExpression(j.identifier('Bun'), j.identifier('spawnSync')),
-      [argsArray, opts]
-    );
-  });
-
-  // 8. fs.promises.readFile(...) → await Bun.file(...).text()
-  root.find(j.AwaitExpression, {
-    argument: {
-      type: 'CallExpression',
-      callee: {
-        type: 'MemberExpression',
-        object: {
-          type: 'MemberExpression',
-          object: obj => fsVars.has(obj.name),
-          property: { name: 'promises' }
-        },
-        property: { name: 'readFile' }
-      }
+    callee: {
+      object: { name: "fs", type: "Identifier" },
+      property: { name: "readFileSync", type: "Identifier" }
     }
-  }).replaceWith(path => {
-    const call = path.node.argument;
-    const fileArg = call.arguments[0];
-    const textCall = j.callExpression(
-      j.memberExpression(
-        j.callExpression(
-          j.memberExpression(j.identifier('Bun'), j.identifier('file')),
-          [fileArg]
+  }).forEach(p => {
+    const [fileArg] = p.node.arguments;
+    const call = j.awaitExpression(
+      j.callExpression(
+        j.memberExpression(
+          j.callExpression(j.memberExpression(j.identifier("Bun"), j.identifier("file")), [fileArg]),
+          j.identifier("text")
         ),
-        j.identifier('text')
-      ),
-      []
+        []
+      )
     );
-    return j.awaitExpression(textCall);
+    ensureAsync(p);
+    p.replace(call);
   });
 
-  // 9. fs.promises.writeFile(...) → await Bun.write(...)
-  root.find(j.AwaitExpression, {
-    argument: {
-      type: 'CallExpression',
-      callee: {
-        type: 'MemberExpression',
-        object: {
-          type: 'MemberExpression',
-          object: obj => fsVars.has(obj.name),
-          property: { name: 'promises' }
-        },
-        property: { name: 'writeFile' }
+  // 4) fs.writeFileSync → await Bun.write()
+  root.find(j.CallExpression, {
+    callee: {
+      object: { name: "fs", type: "Identifier" },
+      property: { name: "writeFileSync", type: "Identifier" }
+    }
+  }).forEach(p => {
+    const [fileArg, dataArg] = p.node.arguments;
+    const call = j.awaitExpression(
+      j.callExpression(
+        j.memberExpression(j.identifier("Bun"), j.identifier("write")),
+        [fileArg, dataArg]
+      )
+    );
+    ensureAsync(p);
+    p.replace(call);
+  });
+
+  // 5) fs.promises.readFile → await Bun.file().text()
+  root.find(j.CallExpression, {
+    callee: {
+      object: {
+        object: { name: "fs", type: "Identifier" },
+        property: { name: "promises", type: "Identifier" }
+      },
+      property: { name: "readFile", type: "Identifier" }
+    }
+  }).forEach(p => {
+    const [fileArg] = p.node.arguments;
+    const call = j.awaitExpression(
+      j.callExpression(
+        j.memberExpression(
+          j.callExpression(j.memberExpression(j.identifier("Bun"), j.identifier("file")), [fileArg]),
+          j.identifier("text")
+        ),
+        []
+      )
+    );
+    ensureAsync(p);
+    p.replace(call);
+  });
+
+  // 6) fs.promises.writeFile → await Bun.write()
+  root.find(j.CallExpression, {
+    callee: {
+      object: {
+        object: { name: "fs", type: "Identifier" },
+        property: { name: "promises", type: "Identifier" }
+      },
+      property: { name: "writeFile", type: "Identifier" }
+    }
+  }).forEach(p => {
+    const [fileArg, dataArg] = p.node.arguments;
+    const call = j.awaitExpression(
+      j.callExpression(
+        j.memberExpression(j.identifier("Bun"), j.identifier("write")),
+        [fileArg, dataArg]
+      )
+    );
+    ensureAsync(p);
+    p.replace(call);
+  });
+
+  // 7) fs.existsSync → await Bun.file(path).exists()
+  root.find(j.CallExpression, {
+    callee: {
+      object: { name: "fs", type: "Identifier" },
+      property: { name: "existsSync", type: "Identifier" }
+    }
+  }).forEach(p => {
+    const [fileArg] = p.node.arguments;
+    const call = j.awaitExpression(
+      j.callExpression(
+        j.memberExpression(
+          j.callExpression(j.memberExpression(j.identifier("Bun"), j.identifier("file")), [fileArg]),
+          j.identifier("exists")
+        ),
+        []
+      )
+    );
+    ensureAsync(p);
+    p.replace(call);
+  });
+
+  // 8) child_process.execSync → Bun.spawnSync
+  root.find(j.CallExpression, {
+    callee: { property: { name: "execSync" } }
+  }).forEach(p => {
+    const [cmdArg, optsArg] = p.node.arguments;
+    const call = j.callExpression(
+      j.memberExpression(j.identifier("Bun"), j.identifier("spawnSync")),
+      [j.arrayExpression([j.literal("sh"), j.literal("-c"), cmdArg]), optsArg || j.objectExpression([])]
+    );
+    p.replace(call);
+  });
+
+  return root.toSource({ quote: "single", trailingComma: true });
+}
+
+// Main
+async function main() {
+  log("▶ transform-config-scripts: starting");
+
+  // Project root
+  const rootUrl  = new URL("../../LibreChat-main", import.meta.url);
+  const rootPath = Bun.fileURLToPath(rootUrl);
+
+  // Scan config scripts
+  const glob = new Glob("config/**/*.{js,ts}");
+  let processed = 0, failed = 0;
+
+  for await (const relFile of glob.scan({ cwd: rootPath, absolute: false, onlyFiles: true })) {
+    processed++;
+    const absFile = path.join(rootPath, relFile);
+    log(`\n→ ${relFile}`);
+
+    let src;
+    try { src = await Bun.file(absFile).text(); }
+    catch (err) { error("  ❌ read failed:", err.message); failed++; continue; }
+
+    let out;
+    try {
+      out = transformSource(src);
+    } catch (err) {
+      error("  ❌ transform failed:", err.message); failed++; continue;
+    }
+
+    if (out === src) {
+      log("  ↪ no changes");
+      continue;
+    }
+
+    if (dryRun) {
+      log("  (dry-run) detected changes");
+    } else {
+      try {
+        await Bun.write(absFile, out);
+        log("  ✔ written");
+      } catch (err) {
+        error("  ❌ write failed:", err.message);
+        failed++;
       }
     }
-  }).replaceWith(path => {
-    const [fileArg, dataArg] = path.node.argument.arguments;
-    const writeCall = j.callExpression(
-      j.memberExpression(j.identifier('Bun'), j.identifier('write')),
-      [fileArg, dataArg]
-    );
-    return j.awaitExpression(writeCall);
-  });
+  }
 
-  // 10. fs.readFileSync(...) & fs.writeFileSync(...) → await Bun.file(...).text()/Bun.write(...)
-  ['readFileSync', 'writeFileSync'].forEach(fn => {
-    root.find(j.CallExpression, {
-      callee: {
-        type: 'MemberExpression',
-        object: obj => fsVars.has(obj.name),
-        property: { name: fn }
-      }
-    }).replaceWith(path => {
-      const call = path.node;
-      const [fileArg, dataArg] = call.arguments;
-      let expr;
-      if (fn === 'readFileSync') {
-        expr = j.callExpression(
-          j.memberExpression(
-            j.callExpression(
-              j.memberExpression(j.identifier('Bun'), j.identifier('file')),
-              [fileArg]
-            ),
-            j.identifier('text')
-          ),
-          []
-        );
-      } else { // writeFileSync
-        expr = j.callExpression(
-          j.memberExpression(j.identifier('Bun'), j.identifier('write')),
-          [fileArg, dataArg]
-        );
-      }
-      // wrap in await and mark fn async
-      ensureAsync(path);
-      return j.awaitExpression(expr);
-    });
-  });
-
-  return root.toSource({ quote: 'single', trailingComma: true });
+  log(`\n✔ transform-config-scripts: processed=${processed}, failed=${failed}`);
+  if (failed) Bun.exit(1);
 }
+
+main().catch(err => {
+  console.error("‼ transform-config-scripts crashed:", err);
+  Bun.exit(1);
+});
